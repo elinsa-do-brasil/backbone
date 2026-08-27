@@ -4,7 +4,6 @@
     "module": "NodeNext",
     "strict": true,
     "skipLibCheck": true,
-    "types": ["node"],
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx",
     "rootDir": "./src",
