@@ -1,0 +1,27 @@
+{
+  "name": "hono",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc",
+    "postinstall": "prisma generate",
+    "auth:generate": "auth generate --config src/lib/auth.ts --output prisma/schema.prisma -y",
+    "db:migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@better-auth/expo": "^1.7.2",
+    "@prisma/adapter-pg": "7.10.0",
+    "@prisma/client": "7.10.0",
+    "better-auth": "^1.7.2",
+    "hono": "^4.13.5",
+    "resend": "^6.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "auth": "1.7.2",
+    "dotenv": "^17.4.2",
+    "prisma": "7.10.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}

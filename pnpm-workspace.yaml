@@ -1,0 +1,18 @@
+allowBuilds:
+  '@prisma/client': true
+  '@prisma/engines': true
+  esbuild: true
+  prisma: true
+minimumReleaseAgeExclude:
+  - '@types/node@26.4.0'
+  - '@better-auth/core@1.7.2'
+  - '@better-auth/drizzle-adapter@1.7.2'
+  - '@better-auth/kysely-adapter@1.7.2'
+  - '@better-auth/memory-adapter@1.7.2'
+  - '@better-auth/mongo-adapter@1.7.2'
+  - '@better-auth/prisma-adapter@1.7.2'
+  - '@better-auth/telemetry@1.7.2'
+  - auth@1.7.2
+  - better-auth@1.7.2
+  - '@better-auth/expo@1.7.2'
+  - resend@6.24.0
