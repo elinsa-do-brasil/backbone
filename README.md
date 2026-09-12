@@ -10,13 +10,22 @@ Backend Hono (template Vercel) com [Better Auth](https://www.better-auth.com), p
 Prerequisites:
 
 - [Vercel CLI](https://vercel.com/docs/cli) installed globally
-- Um banco PostgreSQL (Neon, Vercel Postgres, Supabase, etc.)
+- [Docker](https://docs.docker.com/get-docker/) com Docker Compose
 
 ```
 cp .env.example .env   # preencha DATABASE_URL, BETTER_AUTH_SECRET, etc.
 pnpm install
-pnpm prisma migrate dev --name init
+pnpm db:up
+pnpm db:migrate --name init
 ```
+
+O `pnpm db:up` inicia um PostgreSQL local em `localhost:5432`, com os dados
+persistidos no volume Docker `backbone-postgres`. Para parar o container sem
+apagar os dados, use `pnpm db:down`. Para acompanhar os logs, use
+`pnpm db:logs`.
+
+Se preferir usar Neon, Vercel Postgres ou Supabase, mantenha o fluxo acima e
+substitua apenas `DATABASE_URL` no `.env`.
 
 > No Prisma 7, `DATABASE_URL` é lido em `prisma.config.ts` (via `prisma/config`'s `env()`) e é exigido por **qualquer** comando do CLI, inclusive `prisma generate` — que roda automaticamente no `postinstall`. Por isso o `.env` precisa existir *antes* do `pnpm install`.
 

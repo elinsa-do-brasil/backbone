@@ -6,7 +6,10 @@
     "typecheck": "tsc",
     "postinstall": "prisma generate",
     "auth:generate": "auth generate --config src/lib/auth.ts --output prisma/schema.prisma -y",
-    "db:migrate": "prisma migrate dev"
+    "db:migrate": "prisma migrate dev",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f postgres"
   },
   "dependencies": {
     "@better-auth/expo": "^1.7.2",
