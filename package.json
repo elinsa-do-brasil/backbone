@@ -12,7 +12,6 @@
     "db:logs": "docker compose logs -f postgres"
   },
   "dependencies": {
-    "@better-auth/expo": "^1.7.2",
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",
     "better-auth": "^1.7.2",

@@ -1,20 +1,27 @@
 import { betterAuth } from 'better-auth';
 import { prismaAdapter } from 'better-auth/adapters/prisma';
 import { bearer, emailOTP } from 'better-auth/plugins';
-import { expo } from '@better-auth/expo';
 import { prisma } from './prisma.js';
 import { sendEmail } from './email.js';
-const expoScheme = process.env.EXPO_SCHEME ?? 'myapp';
+import { trustedOrigins } from './trusted-origins.js';
+// Root domain shared by the Next.js app and this backend (e.g. ".example.com"),
+// so the session cookie set here is also visible on the apex domain.
+// Leave unset in local development, where frontend and backend aren't on subdomains.
+const cookieDomain = process.env.COOKIE_DOMAIN;
 export const auth = betterAuth({
     baseURL: process.env.BETTER_AUTH_URL,
     database: prismaAdapter(prisma, {
         provider: 'postgresql'
     }),
-    trustedOrigins: [
-        `${expoScheme}://`,
-        'exp://**',
-        'exp://10.0.0.*:*/**'
-    ],
+    trustedOrigins,
+    advanced: cookieDomain
+        ? {
+            crossSubDomainCookies: {
+                enabled: true,
+                domain: cookieDomain
+            }
+        }
+        : undefined,
     emailAndPassword: {
         enabled: true,
         requireEmailVerification: true,
@@ -38,7 +45,6 @@ export const auth = betterAuth({
         }
     },
     plugins: [
-        expo(),
         emailOTP({
             overrideDefaultEmailVerification: true,
             async sendVerificationOTP({ email, otp, type }) {

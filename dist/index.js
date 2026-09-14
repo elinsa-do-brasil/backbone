@@ -1,12 +1,8 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { auth } from './lib/auth.js';
+import { trustedOrigins } from './lib/trusted-origins.js';
 const app = new Hono();
-const trustedOrigins = process.env.TRUSTED_ORIGINS
-    ? process.env.TRUSTED_ORIGINS.split(',')
-        .map((origin) => origin.trim())
-        .filter(Boolean)
-    : ['http://localhost:8081'];
 app.use('/api/auth/*', cors({
     origin: trustedOrigins,
     allowHeaders: ['Content-Type', 'Authorization'],
