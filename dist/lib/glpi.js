@@ -87,22 +87,40 @@ export async function glpiRequest(method, path, opts) {
         body: opts?.body ? JSON.stringify(opts.body) : undefined
     });
 }
-/** Busca um usuário do GLPI pelo e-mail. `emails` é a relação aninhada filtrável via RSQL. */
+/**
+ * Busca um usuário do GLPI pelo e-mail, em duas tentativas — e as duas são necessárias:
+ *
+ * 1. `emails.email==` acha quem foi cadastrado pelo GLPI (funcionários de verdade), que têm o
+ *    e-mail na relação `emails`.
+ * 2. `username==` acha quem foi criado por esta integração. Motivo: o `POST /Administration/User`
+ *    **ignora silenciosamente** o array `emails` do corpo — responde 201 como se tivesse gravado,
+ *    mas o usuário nasce com `emails: []` (confirmado em teste real). E a API v2 não expõe
+ *    endpoint pra definir o e-mail de outro usuário (só `/User/Me/Email`, do próprio autenticado).
+ *    Como [createUser] grava o e-mail no `username`, é por ele que dá pra reencontrar.
+ *
+ * Sem a segunda tentativa, a busca nunca acha quem a própria integração criou e cada chamado
+ * novo geraria um usuário duplicado no GLPI.
+ */
 export async function findUserByEmail(email) {
-    const results = (await glpiRequest('GET', `/Administration/User?filter=emails.email==${encodeURIComponent(email)}&limit=1`));
-    return results?.[0] ?? null;
+    const encoded = encodeURIComponent(email);
+    const byEmail = (await glpiRequest('GET', `/Administration/User?filter=emails.email==${encoded}&limit=1`));
+    if (byEmail?.[0])
+        return byEmail[0];
+    const byUsername = (await glpiRequest('GET', `/Administration/User?filter=username==${encoded}&limit=1`));
+    return byUsername?.[0] ?? null;
 }
 /**
  * Cria um usuário no GLPI a partir do e-mail. Sem senha de propósito: essa conta nunca é usada
  * pra login — existe só pra o chamado ter o requerente certo em vez da conta de serviço.
+ *
+ * O `username` recebe o e-mail porque é o único campo que a API grava de fato (ver [findUserByEmail]).
+ * Consequência conhecida: o usuário fica **sem endereço de e-mail** no GLPI, então o GLPI não
+ * consegue notificá-lo por e-mail sobre o chamado — quem for atender precisa preencher isso na UI,
+ * ou o e-mail precisa vir de outra fonte (LDAP/sync).
  */
 export async function createUser(params) {
     return (await glpiRequest('POST', '/Administration/User', {
-        body: {
-            username: params.email,
-            firstname: params.displayName,
-            emails: [{ email: params.email, is_default: true }]
-        }
+        body: { username: params.email, firstname: params.displayName }
     }));
 }
 export async function findOrCreateUserByEmail(email, displayName) {

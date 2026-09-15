@@ -31,6 +31,18 @@ Teste de escrita real contra a instância (chamado #34, usuário #17 criados —
 **Direitos necessários no perfil "Bot"** (Administração > Perfis): além de criar/ver chamados, precisa de "Adicionar (requerente)" em Acompanhamentos/Tarefas e dos direitos de atribuição (Ver atribuído / Atribuir / Apropriar / Ficar encarregado). Sem isso, o `POST .../TeamMember` dá 403 e o chamado fica sem requerente.
 
 **Nome do campo — cuidado:** o campo que identifica o usuário é **`id`**, e o schema auto-gerado do GLPI marca esse `id` como `readOnly` (isto é, a doc diz que não é aceito na escrita — a doc está errada). Testados na mesma instância: `items_id` → **500**, `users_id` → **500**, `id` → **201**. Não trocar por `items_id` "pra seguir o padrão do resto da API" sem testar.
+
+### `POST /Administration/User` ignora o array `emails` (silenciosamente)
+
+Descoberto no teste ponta a ponta pelo app (2026-09-14). Mandar `emails: [{email, is_default: true}]` no corpo da criação **não grava nada**: o GLPI responde **201** normalmente, mas o usuário nasce com `emails: []`. Comparação na mesma instância: usuário criado pela UI do GLPI tem `emails:[{...}]`; usuários criados pela API (#17, #18) têm `emails: []`.
+
+E a API v2 **não tem** endpoint pra definir o e-mail de outro usuário — existe só `/Administration/User/Me/Email`, que age sobre o próprio usuário autenticado (a conta de serviço).
+
+**Impacto, se não tratado:** `findUserByEmail` buscava só por `emails.email==`, nunca achava quem a própria integração tinha criado, e **cada chamado novo criaria um usuário duplicado** no GLPI.
+
+**Como está tratado:** `findUserByEmail` tenta em duas etapas — `emails.email==` (acha funcionários cadastrados pela UI, que têm e-mail de verdade) e, se não achar, `username==` (acha quem esta integração criou, já que `createUser` grava o e-mail no `username`).
+
+**Limitação que fica de pé:** usuário auto-provisionado fica **sem endereço de e-mail** no GLPI, então o GLPI não consegue mandar notificação de chamado pra ele. Resolver depois por outro caminho (preencher na UI, LDAP/sync, ou algum import).
 - **GET não pode levar `Content-Type: application/json`**: o GLPI tenta ler o corpo vazio como JSON e responde 400 "Corpo JSON inválido". `glpiRequest()` só manda o header quando há corpo.
 
 ### Implementado (etapa 2)
