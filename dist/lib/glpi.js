@@ -113,16 +113,21 @@ export async function findOrCreateUserByEmail(email, displayName) {
  * (`TeamMember`), não um campo do próprio ticket. Sem isso o chamado sairia como se a conta de
  * serviço fosse a pessoa que pediu.
  *
- * `items_id` não aparece no schema auto-gerado do GLPI pra esse endpoint (lacuna na doc deles),
- * mas é o campo usado no resto da API pro mesmo par polimórfico tipo/id — confirmar no primeiro
- * uso real; se estiver errado, o GLPI responde 400 sem gravar nada.
+ * O campo que identifica o usuário é `id` — confirmado em teste real. O schema auto-gerado do
+ * GLPI marca esse `id` como `readOnly` (ou seja, a doc diz que ele não é aceito na escrita), mas
+ * é justamente ele que funciona: `items_id` e `users_id`, que seriam o padrão do resto da API,
+ * respondem **500**. Não "corrigir" isso pra items_id sem testar de novo contra a instância.
+ *
+ * O chamado é criado antes desta segunda chamada, então uma falha aqui deixa um chamado sem
+ * requerente no GLPI (o GLPI não atribui a conta de serviço por padrão — o chamado nasce sem
+ * ator nenhum) e o erro sobe pro app.
  */
 export async function createTicketForRequester(params) {
     const ticket = (await glpiRequest('POST', '/Assistance/Ticket', {
         body: { name: params.name, content: params.content }
     }));
     await glpiRequest('POST', `/Assistance/Ticket/${ticket.id}/TeamMember`, {
-        body: { type: 'User', items_id: params.requesterUserId, role: 'requester' }
+        body: { type: 'User', id: params.requesterUserId, role: 'requester' }
     });
     return ticket;
 }

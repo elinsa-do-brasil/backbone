@@ -136,15 +136,14 @@ export async function findOrCreateUserByEmail(email: string, displayName: string
  * (`TeamMember`), não um campo do próprio ticket. Sem isso o chamado sairia como se a conta de
  * serviço fosse a pessoa que pediu.
  *
- * ATENÇÃO — hoje esta função falha na segunda chamada: o GLPI responde **403
- * ERROR_RIGHT_MISSING** no `POST .../TeamMember` porque o perfil "Bot" da conta de serviço não
- * tem direito de mexer nos atores do chamado (confirmado em teste real contra a instância).
- * Enquanto esse direito não for concedido no GLPI, cada tentativa deixa um chamado **sem
- * requerente nenhum** (testado: o GLPI não coloca a conta de serviço como requerente por padrão,
- * a lista de atores fica vazia) e devolve erro pro app.
+ * O campo que identifica o usuário é `id` — confirmado em teste real. O schema auto-gerado do
+ * GLPI marca esse `id` como `readOnly` (ou seja, a doc diz que ele não é aceito na escrita), mas
+ * é justamente ele que funciona: `items_id` e `users_id`, que seriam o padrão do resto da API,
+ * respondem **500**. Não "corrigir" isso pra items_id sem testar de novo contra a instância.
  *
- * O nome do campo `items_id` segue sem confirmação: a requisição é barrada no check de direitos
- * antes de o GLPI validar o corpo. Revalidar assim que o direito existir.
+ * O chamado é criado antes desta segunda chamada, então uma falha aqui deixa um chamado sem
+ * requerente no GLPI (o GLPI não atribui a conta de serviço por padrão — o chamado nasce sem
+ * ator nenhum) e o erro sobe pro app.
  */
 export async function createTicketForRequester(params: {
   requesterUserId: number
@@ -156,7 +155,7 @@ export async function createTicketForRequester(params: {
   })) as { id: number }
 
   await glpiRequest('POST', `/Assistance/Ticket/${ticket.id}/TeamMember`, {
-    body: { type: 'User', items_id: params.requesterUserId, role: 'requester' }
+    body: { type: 'User', id: params.requesterUserId, role: 'requester' }
   })
 
   return ticket

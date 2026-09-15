@@ -13,9 +13,9 @@ A doc pública não cobre o shape completo da v2; o spec que a instância serve,
 - **Recursos são namespaced**: `/Administration/User`, `/Assistance/Ticket`, `/Assistance/Ticket/{id}/TeamMember` — não `/User`/`/Ticket` soltos como na API legada.
 - **`User`**: o login é `username` (não `name`); e-mails ficam na relação aninhada `emails: [{email, is_default, is_dynamic}]`. Filtro RSQL por e-mail: `?filter=emails.email==<email>`.
 - **`Ticket`**: `name`, `content` (html), `entity: {id}`, `urgency`/`impact`/`priority` (1–5), `user_recipient: {id}` = quem *registrou*, que **não** é o requerente.
-- **Requerente é sub-recurso**: `POST /Assistance/Ticket/{id}/TeamMember` com `{type: "User", items_id: <id>, role: "requester"}`. O `items_id` **não** aparece no schema auto-gerado desse endpoint (lacuna da doc do GLPI) e **continua não confirmado** — ver o bloqueio de direitos abaixo.
+- **Requerente é sub-recurso**: `POST /Assistance/Ticket/{id}/TeamMember` com `{type: "User", id: <users_id>, role: "requester"}`.
 
-### BLOQUEIO CONHECIDO — atribuição de requerente (teste real, 2026-09-14)
+### Atribuição de requerente — validado em teste real (2026-09-14)
 
 Teste de escrita real contra a instância (chamado #34, usuário #17 criados — limpar manualmente):
 
@@ -25,11 +25,12 @@ Teste de escrita real contra a instância (chamado #34, usuário #17 criados —
 | `POST /Administration/User` (`username`/`firstname`/`emails[]`) | **201** `{id, href}` — criação de usuário confirmada |
 | `POST /Assistance/Ticket` (`name`/`content`) | **201** `{id, href}` — criação de chamado confirmada |
 | `GET /Assistance/Ticket/{id}/TeamMember` (logo após criar) | **200 `[]`** — o GLPI **não** coloca a conta de serviço como requerente por padrão; o chamado nasce **sem ator nenhum** |
-| `POST /Assistance/Ticket/{id}/TeamMember` | **403 `ERROR_RIGHT_MISSING`** — perfil "Bot" não pode mexer nos atores |
+| `POST .../TeamMember` **antes** dos direitos | **403 `ERROR_RIGHT_MISSING`** |
+| `POST .../TeamMember` **depois** dos direitos | **201** com `{type:"User", id, role:"requester"}` ✅ |
 
-**Consequência prática:** `POST /api/glpi/tickets` hoje cria o chamado e depois falha — sobra um chamado sem requerente no GLPI e o app recebe 502. **Não usar em produção até o direito ser concedido.**
+**Direitos necessários no perfil "Bot"** (Administração > Perfis): além de criar/ver chamados, precisa de "Adicionar (requerente)" em Acompanhamentos/Tarefas e dos direitos de atribuição (Ver atribuído / Atribuir / Apropriar / Ficar encarregado). Sem isso, o `POST .../TeamMember` dá 403 e o chamado fica sem requerente.
 
-**O que falta (ação no GLPI, não no código):** dar ao perfil "Bot" o direito de gerenciar atores/atribuição de chamado (na config do perfil, seção de Chamados — candidatos: "Atribuir um chamado" / direito de edição de chamado). Depois disso, revalidar: (a) se o `403` some, (b) se `items_id` é mesmo o campo certo (pode virar 400 e precisar de outro nome), (c) se o requerente final aparece como o usuário real.
+**Nome do campo — cuidado:** o campo que identifica o usuário é **`id`**, e o schema auto-gerado do GLPI marca esse `id` como `readOnly` (isto é, a doc diz que não é aceito na escrita — a doc está errada). Testados na mesma instância: `items_id` → **500**, `users_id` → **500**, `id` → **201**. Não trocar por `items_id` "pra seguir o padrão do resto da API" sem testar.
 - **GET não pode levar `Content-Type: application/json`**: o GLPI tenta ler o corpo vazio como JSON e responde 400 "Corpo JSON inválido". `glpiRequest()` só manda o header quando há corpo.
 
 ### Implementado (etapa 2)
