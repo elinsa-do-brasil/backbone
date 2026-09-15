@@ -12,9 +12,11 @@
     "db:logs": "docker compose logs -f postgres"
   },
   "dependencies": {
+    "@better-auth/passkey": "^1.7.4",
+    "@hono/node-server": "^2.1.1",
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",
-    "better-auth": "^1.7.2",
+    "better-auth": "^1.7.4",
     "hono": "^4.13.5",
     "resend": "^6.24.0"
   },

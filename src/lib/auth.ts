@@ -1,6 +1,7 @@
 import { betterAuth } from 'better-auth'
 import { prismaAdapter } from 'better-auth/adapters/prisma'
-import { bearer, emailOTP } from 'better-auth/plugins'
+import { bearer, emailOTP, oneTimeToken } from 'better-auth/plugins'
+import { passkey } from '@better-auth/passkey'
 import { prisma } from './prisma.js'
 import { sendEmail } from './email.js'
 import { trustedOrigins } from './trusted-origins.js'
@@ -9,6 +10,24 @@ import { trustedOrigins } from './trusted-origins.js'
 // so the session cookie set here is also visible on the apex domain.
 // Leave unset in local development, where frontend and backend aren't on subdomains.
 const cookieDomain = process.env.COOKIE_DOMAIN
+
+// WebAuthn Relying Party ID: the registrable domain passkeys are bound to.
+// Must be the same across the Next.js app and this backend, so it's derived
+// from COOKIE_DOMAIN (without the leading dot). "localhost" is fine for dev.
+const rpID = cookieDomain?.replace(/^\./, '') ?? 'localhost'
+
+// WebAuthn origins allowed to complete passkey ceremonies. Setting this list
+// at all (rather than leaving it undefined) makes better-auth check strictly
+// against it instead of trusting whatever Origin header the request sends, so
+// it must include every legitimate origin: the web app's (trustedOrigins) and
+// native ones from PASSKEY_ORIGINS — e.g. the Kotlin/Android app's
+// `android:apk-key-hash:<base64url SHA-256 of the signing cert>`.
+const passkeyNativeOrigins = process.env.PASSKEY_ORIGINS
+  ? process.env.PASSKEY_ORIGINS.split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean)
+  : []
+const passkeyOrigins = [...trustedOrigins, ...passkeyNativeOrigins]
 
 export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL,
@@ -63,6 +82,15 @@ export const auth = betterAuth({
         })
       }
     }),
+    passkey({
+      rpID,
+      rpName: 'Backbone',
+      origin: passkeyOrigins
+    }),
+    // Lets /native-oauth-bridge hand off a short-lived token to native
+    // clients after a browser-based OAuth redirect (see src/index.ts),
+    // since they can't read the Set-Cookie the OAuth callback response sets.
+    oneTimeToken(),
     bearer()
   ]
 })
