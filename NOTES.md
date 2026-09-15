@@ -6,7 +6,42 @@
 - **Token por chamada, sem cache**: `src/lib/glpi.ts` pede um `access_token` novo a cada `glpiRequest`/`checkGlpiConnection`. Proposital — deploy serverless na Vercel não tem estado confiável entre invocações pra cachear o token com segurança, e o grant `password` não retorna `refresh_token` (só o grant `authorization_code`, que exige login interativo e não serve pra conta de serviço).
 - Endpoint desta etapa: `GET /api/glpi/status` (`src/routes/glpi.ts`), só confirma que o backend consegue autenticar a conta de serviço no GLPI. Nenhum dado real do GLPI é exposto ainda.
 - **Conta de serviço: perfil dedicado, direitos mínimos.** O grant `password` usa a senha real dessa conta (não um token pessoal revogável como na API legada) — se vazar, dá pra logar na UI do GLPI inteira como esse usuário, não só via API. Por isso: usuário técnico dedicado (não reaproveitar conta de funcionário), perfil próprio sem direitos de Config/Admin, restrito à(s) Entidade(s) corretas, senha só como secret (nunca no repo).
-- Fora de escopo / não implementado: busca/auto-criação de `User` por e-mail, criação/listagem/acompanhamento de `Ticket`, qualquer UI de chamados.
+### Shapes reais da API v2 (conferidos no OpenAPI da própria instância, `GET /api.php/doc.json`)
+
+A doc pública não cobre o shape completo da v2; o spec que a instância serve, sim. Achados que valem lembrar:
+
+- **Recursos são namespaced**: `/Administration/User`, `/Assistance/Ticket`, `/Assistance/Ticket/{id}/TeamMember` — não `/User`/`/Ticket` soltos como na API legada.
+- **`User`**: o login é `username` (não `name`); e-mails ficam na relação aninhada `emails: [{email, is_default, is_dynamic}]`. Filtro RSQL por e-mail: `?filter=emails.email==<email>`.
+- **`Ticket`**: `name`, `content` (html), `entity: {id}`, `urgency`/`impact`/`priority` (1–5), `user_recipient: {id}` = quem *registrou*, que **não** é o requerente.
+- **Requerente é sub-recurso**: `POST /Assistance/Ticket/{id}/TeamMember` com `{type: "User", items_id: <id>, role: "requester"}`. O `items_id` **não** aparece no schema auto-gerado desse endpoint (lacuna da doc do GLPI) e **continua não confirmado** — ver o bloqueio de direitos abaixo.
+
+### BLOQUEIO CONHECIDO — atribuição de requerente (teste real, 2026-09-14)
+
+Teste de escrita real contra a instância (chamado #34, usuário #17 criados — limpar manualmente):
+
+| Passo | Resultado |
+|---|---|
+| `GET /Administration/User?filter=emails.email==<email>` | **200**, array direto — filtro por e-mail confirmado |
+| `POST /Administration/User` (`username`/`firstname`/`emails[]`) | **201** `{id, href}` — criação de usuário confirmada |
+| `POST /Assistance/Ticket` (`name`/`content`) | **201** `{id, href}` — criação de chamado confirmada |
+| `GET /Assistance/Ticket/{id}/TeamMember` (logo após criar) | **200 `[]`** — o GLPI **não** coloca a conta de serviço como requerente por padrão; o chamado nasce **sem ator nenhum** |
+| `POST /Assistance/Ticket/{id}/TeamMember` | **403 `ERROR_RIGHT_MISSING`** — perfil "Bot" não pode mexer nos atores |
+
+**Consequência prática:** `POST /api/glpi/tickets` hoje cria o chamado e depois falha — sobra um chamado sem requerente no GLPI e o app recebe 502. **Não usar em produção até o direito ser concedido.**
+
+**O que falta (ação no GLPI, não no código):** dar ao perfil "Bot" o direito de gerenciar atores/atribuição de chamado (na config do perfil, seção de Chamados — candidatos: "Atribuir um chamado" / direito de edição de chamado). Depois disso, revalidar: (a) se o `403` some, (b) se `items_id` é mesmo o campo certo (pode virar 400 e precisar de outro nome), (c) se o requerente final aparece como o usuário real.
+- **GET não pode levar `Content-Type: application/json`**: o GLPI tenta ler o corpo vazio como JSON e responde 400 "Corpo JSON inválido". `glpiRequest()` só manda o header quando há corpo.
+
+### Implementado (etapa 2)
+
+- `findUserByEmail` / `createUser` / `findOrCreateUserByEmail` e `createTicketForRequester` em `src/lib/glpi.ts`.
+- `POST /api/glpi/tickets` (`src/routes/glpi.ts`): exige sessão Better Auth, resolve/cria o `User` do GLPI pelo e-mail da sessão e abre o chamado com esse requerente.
+
+### Fora de escopo / não implementado
+
+- **Update/Delete de `Ticket`**: o perfil "Bot" só tem criar/ver. Precisa mexer nos direitos no GLPI antes, não é questão de código.
+- **Listar os chamados de um usuário**: filtrar a coleção `Ticket` pelo ator (`?filter=team.id==`, `?filter=team.role==`) faz o GLPI responder **HTTP 500**. Duas saídas quando for a hora: (a) achar o filtro certo/corrigir do lado do GLPI, ou (b) guardar o par `(usuário do app, id do ticket)` numa tabela própria no Postgres daqui ao criar o chamado, e listar a partir dela.
+- UI de chamados no app além do formulário de abertura (a listagem depende do item acima).
 
 ### Status (2026-09-14)
 

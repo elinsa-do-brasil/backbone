@@ -70,7 +70,11 @@ export async function checkGlpiConnection() {
 }
 /**
  * Executa uma chamada autenticada contra a API REST v2 do GLPI. `path` é relativo a
- * `GLPI_URL_API` (ex.: `/User`, `/Ticket`).
+ * `GLPI_URL_API` e os recursos são namespaced (ex.: `/Administration/User`, `/Assistance/Ticket`),
+ * não nomes soltos como na API legada.
+ *
+ * `Content-Type` só vai quando há corpo: em requisição sem corpo o GLPI tenta interpretar o corpo
+ * vazio como JSON e responde 400 "Corpo JSON inválido" (confirmado contra a instância real).
  */
 export async function glpiRequest(method, path, opts) {
     const accessToken = await getAccessToken();
@@ -78,8 +82,47 @@ export async function glpiRequest(method, path, opts) {
         method,
         headers: {
             Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
+            ...(opts?.body ? { 'Content-Type': 'application/json' } : {})
         },
         body: opts?.body ? JSON.stringify(opts.body) : undefined
     });
+}
+/** Busca um usuário do GLPI pelo e-mail. `emails` é a relação aninhada filtrável via RSQL. */
+export async function findUserByEmail(email) {
+    const results = (await glpiRequest('GET', `/Administration/User?filter=emails.email==${encodeURIComponent(email)}&limit=1`));
+    return results?.[0] ?? null;
+}
+/**
+ * Cria um usuário no GLPI a partir do e-mail. Sem senha de propósito: essa conta nunca é usada
+ * pra login — existe só pra o chamado ter o requerente certo em vez da conta de serviço.
+ */
+export async function createUser(params) {
+    return (await glpiRequest('POST', '/Administration/User', {
+        body: {
+            username: params.email,
+            firstname: params.displayName,
+            emails: [{ email: params.email, is_default: true }]
+        }
+    }));
+}
+export async function findOrCreateUserByEmail(email, displayName) {
+    return (await findUserByEmail(email)) ?? (await createUser({ email, displayName }));
+}
+/**
+ * Cria um chamado e atribui o requerente numa segunda chamada — no GLPI o ator é um sub-recurso
+ * (`TeamMember`), não um campo do próprio ticket. Sem isso o chamado sairia como se a conta de
+ * serviço fosse a pessoa que pediu.
+ *
+ * `items_id` não aparece no schema auto-gerado do GLPI pra esse endpoint (lacuna na doc deles),
+ * mas é o campo usado no resto da API pro mesmo par polimórfico tipo/id — confirmar no primeiro
+ * uso real; se estiver errado, o GLPI responde 400 sem gravar nada.
+ */
+export async function createTicketForRequester(params) {
+    const ticket = (await glpiRequest('POST', '/Assistance/Ticket', {
+        body: { name: params.name, content: params.content }
+    }));
+    await glpiRequest('POST', `/Assistance/Ticket/${ticket.id}/TeamMember`, {
+        body: { type: 'User', items_id: params.requesterUserId, role: 'requester' }
+    });
+    return ticket;
 }

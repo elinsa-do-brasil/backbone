@@ -86,7 +86,11 @@ export async function checkGlpiConnection(): Promise<boolean> {
 
 /**
  * Executa uma chamada autenticada contra a API REST v2 do GLPI. `path` é relativo a
- * `GLPI_URL_API` (ex.: `/User`, `/Ticket`).
+ * `GLPI_URL_API` e os recursos são namespaced (ex.: `/Administration/User`, `/Assistance/Ticket`),
+ * não nomes soltos como na API legada.
+ *
+ * `Content-Type` só vai quando há corpo: em requisição sem corpo o GLPI tenta interpretar o corpo
+ * vazio como JSON e responde 400 "Corpo JSON inválido" (confirmado contra a instância real).
  */
 export async function glpiRequest(method: string, path: string, opts?: { body?: unknown }): Promise<unknown> {
   const accessToken = await getAccessToken()
@@ -94,8 +98,66 @@ export async function glpiRequest(method: string, path: string, opts?: { body?: 
     method,
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json'
+      ...(opts?.body ? { 'Content-Type': 'application/json' } : {})
     },
     body: opts?.body ? JSON.stringify(opts.body) : undefined
   })
+}
+
+/** Busca um usuário do GLPI pelo e-mail. `emails` é a relação aninhada filtrável via RSQL. */
+export async function findUserByEmail(email: string): Promise<{ id: number } | null> {
+  const results = (await glpiRequest(
+    'GET',
+    `/Administration/User?filter=emails.email==${encodeURIComponent(email)}&limit=1`
+  )) as Array<{ id: number }> | null
+  return results?.[0] ?? null
+}
+
+/**
+ * Cria um usuário no GLPI a partir do e-mail. Sem senha de propósito: essa conta nunca é usada
+ * pra login — existe só pra o chamado ter o requerente certo em vez da conta de serviço.
+ */
+export async function createUser(params: { email: string; displayName: string }): Promise<{ id: number }> {
+  return (await glpiRequest('POST', '/Administration/User', {
+    body: {
+      username: params.email,
+      firstname: params.displayName,
+      emails: [{ email: params.email, is_default: true }]
+    }
+  })) as { id: number }
+}
+
+export async function findOrCreateUserByEmail(email: string, displayName: string): Promise<{ id: number }> {
+  return (await findUserByEmail(email)) ?? (await createUser({ email, displayName }))
+}
+
+/**
+ * Cria um chamado e atribui o requerente numa segunda chamada — no GLPI o ator é um sub-recurso
+ * (`TeamMember`), não um campo do próprio ticket. Sem isso o chamado sairia como se a conta de
+ * serviço fosse a pessoa que pediu.
+ *
+ * ATENÇÃO — hoje esta função falha na segunda chamada: o GLPI responde **403
+ * ERROR_RIGHT_MISSING** no `POST .../TeamMember` porque o perfil "Bot" da conta de serviço não
+ * tem direito de mexer nos atores do chamado (confirmado em teste real contra a instância).
+ * Enquanto esse direito não for concedido no GLPI, cada tentativa deixa um chamado **sem
+ * requerente nenhum** (testado: o GLPI não coloca a conta de serviço como requerente por padrão,
+ * a lista de atores fica vazia) e devolve erro pro app.
+ *
+ * O nome do campo `items_id` segue sem confirmação: a requisição é barrada no check de direitos
+ * antes de o GLPI validar o corpo. Revalidar assim que o direito existir.
+ */
+export async function createTicketForRequester(params: {
+  requesterUserId: number
+  name: string
+  content: string
+}): Promise<{ id: number }> {
+  const ticket = (await glpiRequest('POST', '/Assistance/Ticket', {
+    body: { name: params.name, content: params.content }
+  })) as { id: number }
+
+  await glpiRequest('POST', `/Assistance/Ticket/${ticket.id}/TeamMember`, {
+    body: { type: 'User', items_id: params.requesterUserId, role: 'requester' }
+  })
+
+  return ticket
 }
