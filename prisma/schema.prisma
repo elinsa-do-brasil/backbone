@@ -22,6 +22,8 @@ model User {
 
   passkeys Passkey[]
 
+  glpiTickets GlpiTicket[]
+
   @@unique([email])
   @@map("user")
 }
@@ -93,4 +95,20 @@ model Passkey {
   @@index([userId])
   @@index([credentialID])
   @@map("passkey")
+}
+
+// A API v2 do GLPI não permite listar chamados filtrando pelo ator (`?filter=team.id==`
+// responde HTTP 500 — ver NOTES.md), então o vínculo (usuário do app, chamado do GLPI) é
+// rastreado aqui, gravado no momento em que o chamado é criado via POST /api/glpi/tickets.
+// `name` fica duplicado do GLPI só como fallback pra listagem quando a consulta ao GLPI falhar.
+model GlpiTicket {
+  id        Int      @id @default(autoincrement())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  glpiId    Int
+  name      String
+  createdAt DateTime @default(now())
+
+  @@unique([userId, glpiId])
+  @@map("glpi_ticket")
 }

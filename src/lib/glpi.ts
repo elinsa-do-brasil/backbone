@@ -182,3 +182,149 @@ export async function createTicketForRequester(params: {
 
   return ticket
 }
+
+export interface GlpiTicketSummary {
+  id: number
+  name: string
+  status: unknown
+  date: string
+  date_mod: string
+}
+
+/**
+ * Busca um chamado pelo id. Usado pra enriquecer a listagem (que vem da tabela própria no
+ * Postgres, não do GLPI — ver NOTES.md) com os dados atuais do GLPI: status, datas.
+ *
+ * `status` é devolvido como veio do GLPI — na instância real é um objeto `{id, name}` (id é a
+ * constante ITIL numérica: 1=Novo, 2=Processando/atribuído, 3=Processando/planejado, 4=Pendente,
+ * 5=Solucionado, 6=Fechado; `name` já vem traduzido pelo GLPI), não um valor opaco int/string.
+ * Confirmado contra a instância real (2026-09-16), não documentado na doc pública da API.
+ */
+export async function getTicket(id: number): Promise<GlpiTicketSummary> {
+  return (await glpiRequest('GET', `/Assistance/Ticket/${id}`)) as GlpiTicketSummary
+}
+
+export interface GlpiFollowup {
+  id: number
+  content: string
+  date: string
+  authorName: string | null
+  authorEmail: string | null
+  isPrivate: boolean
+}
+
+/**
+ * Lista os followups (acompanhamentos) públicos de um chamado.
+ *
+ * Path real confirmado contra a instância (2026-09-16): `/Assistance/Ticket/{id}/Timeline/Followup`
+ * — não `/Assistance/Ticket/{id}/ITILFollowup` (o padrão usado por `TeamMember` não se repete
+ * aqui). O schema published (`GET /api.php/doc.json`) chama o recurso de `Followup`
+ * (`x-itemtype: ITILFollowup`).
+ *
+ * **Cada item vem envelopado, não plano** — `[{type: "Followup", item: {id, content, is_private,
+ * user, ...}}]`, não `[{id, content, ...}]` direto como o schema do `doc.json` sugere. Só foi
+ * possível confirmar isso depois que o direito de leitura foi concedido no perfil "Bot" (ver
+ * histórico abaixo) — até lá a coleção sempre vinha vazia e não dava pra ver o shape real. Ler o
+ * campo errado (ex.: `followup.is_private` em vez de `followup.item.is_private`) dá `undefined`,
+ * que passa no filtro de privacidade sem erro — ou seja, um followup **privado vazaria pro
+ * requerente**. Cuidado ao mexer aqui: testar sempre com um followup privado de verdade na
+ * resposta, não só checar o `status` HTTP.
+ *
+ * `authorEmail` é best-effort: o followup só embute `user: {id, name}` (sem e-mail), então pra
+ * cada autor único é feita uma segunda chamada a `/Administration/User/{id}`. Falha nessa segunda
+ * chamada não derruba a listagem inteira — só aquele item fica com `authorEmail: null`. E pra
+ * requerentes auto-provisionados (ver [findOrCreateUserByEmail]) sempre vai vir `null`, porque
+ * esses usuários nascem sem e-mail no GLPI — limitação conhecida, não bug daqui.
+ *
+ * **Histórico do bloqueio de direitos (2026-09-16, resolvido):** o perfil "Bot" tinha direito de
+ * criar followup (herdado do direito de Chamados) mas não de ver — só "Adicionar (requerente)"
+ * estava marcado na aba Chamados > Acompanhamentos/Tarefas, não "Ver". `POST` respondia 201
+ * normalmente, mas `GET` da coleção devolvia `[]` mesmo com followups reais gravados, e
+ * `GET .../Timeline/Followup/{subitem_id}` do item recém-criado respondia 404
+ * `ERROR_ITEM_NOT_FOUND` — o GLPI filtra silenciosamente o que o perfil não pode ver, não dá 403.
+ * Corrigido no GLPI (perfil Bot, direito de Ver em Acompanhamentos concedido) — confirmado
+ * funcionando no mesmo dia, relendo os followups de teste criados durante a investigação.
+ */
+export async function listTicketFollowups(ticketId: number): Promise<GlpiFollowup[]> {
+  const raw = (await glpiRequest('GET', `/Assistance/Ticket/${ticketId}/Timeline/Followup`)) as Array<{
+    type: string
+    item: {
+      id: number
+      content: string
+      date: string
+      is_private: boolean
+      user?: { id: number; name: string | null } | null
+    }
+  }>
+
+  const publicFollowups = (raw ?? []).map((entry) => entry.item).filter((followup) => !followup.is_private)
+
+  const authorIds = [
+    ...new Set(publicFollowups.map((followup) => followup.user?.id).filter((id): id is number => typeof id === 'number'))
+  ]
+
+  const emailByAuthorId = new Map<number, string | null>()
+  await Promise.all(
+    authorIds.map(async (authorId) => {
+      try {
+        const user = (await glpiRequest('GET', `/Administration/User/${authorId}`)) as {
+          emails?: Array<{ email: string; is_default?: boolean }>
+        }
+        const email = user.emails?.find((e) => e.is_default)?.email ?? user.emails?.[0]?.email ?? null
+        emailByAuthorId.set(authorId, email)
+      } catch (error) {
+        console.error(`Falha ao buscar e-mail do autor ${authorId} do followup:`, error)
+        emailByAuthorId.set(authorId, null)
+      }
+    })
+  )
+
+  return publicFollowups.map((followup) => ({
+    id: followup.id,
+    content: followup.content,
+    date: followup.date,
+    authorName: followup.user?.name ?? null,
+    authorEmail: followup.user?.id != null ? (emailByAuthorId.get(followup.user.id) ?? null) : null,
+    isPrivate: false
+  }))
+}
+
+/**
+ * Cria um followup público num chamado, atribuído ao requerente (não à conta de serviço).
+ *
+ * `user: {id: requesterUserId}` no corpo é necessário — sem ele, o GLPI atribui o followup a quem
+ * está autenticado na API (a conta de serviço "filament"), então o followup apareceria de volta
+ * pra qualquer outro leitor como se o bot tivesse escrito, não o requerente. Confirmado contra a
+ * instância real (2026-09-16): sem o campo, `GET` mostra `user: {id: 16, name: "filament"}`;
+ * com o campo, mostra o usuário certo. `requesterUserId` é o mesmo id resolvido por
+ * [findOrCreateUserByEmail] (o `User` do GLPI correspondente ao e-mail da sessão do app).
+ *
+ * A resposta é montada localmente a partir da sessão do Better Auth (`authorName`/`authorEmail`
+ * do próprio usuário que está postando) em vez de reler o followup criado no GLPI — mantém o
+ * `POST` rápido (uma chamada em vez de duas) e não depende de o `GET` de followups estar
+ * funcionando. Note que isso pode divergir do que um `GET` posterior mostra: pra requerentes
+ * auto-provisionados (sem e-mail gravado no GLPI, ver [findOrCreateUserByEmail]), o `user.name`
+ * que o GLPI devolve na releitura é o `username` (que aqui é o próprio e-mail), não o nome de
+ * exibição — então `authorName` pode aparecer como "Fulano de Tal" logo após o envio (eco local)
+ * e como "fulano@empresa.com" numa releitura posterior (vindo do GLPI). Comportamento esperado,
+ * não bug — documentado também em [listTicketFollowups].
+ */
+export async function createTicketFollowup(
+  ticketId: number,
+  content: string,
+  author: { name: string; email: string },
+  requesterUserId: number
+): Promise<GlpiFollowup> {
+  const created = (await glpiRequest('POST', `/Assistance/Ticket/${ticketId}/Timeline/Followup`, {
+    body: { content, user: { id: requesterUserId } }
+  })) as { id: number }
+
+  return {
+    id: created.id,
+    content,
+    date: new Date().toISOString(),
+    authorName: author.name,
+    authorEmail: author.email,
+    isPrivate: false
+  }
+}

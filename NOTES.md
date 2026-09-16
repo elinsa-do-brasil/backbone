@@ -53,8 +53,42 @@ E a API v2 **não tem** endpoint pra definir o e-mail de outro usuário — exis
 ### Fora de escopo / não implementado
 
 - **Update/Delete de `Ticket`**: o perfil "Bot" só tem criar/ver. Precisa mexer nos direitos no GLPI antes, não é questão de código.
-- **Listar os chamados de um usuário**: filtrar a coleção `Ticket` pelo ator (`?filter=team.id==`, `?filter=team.role==`) faz o GLPI responder **HTTP 500**. Duas saídas quando for a hora: (a) achar o filtro certo/corrigir do lado do GLPI, ou (b) guardar o par `(usuário do app, id do ticket)` numa tabela própria no Postgres daqui ao criar o chamado, e listar a partir dela.
-- UI de chamados no app além do formulário de abertura (a listagem depende do item acima).
+- **`GET /api/glpi/tickets/{id}` (detalhe de um chamado)**: cogitado, mas o app (client Android/Filament) não precisou — o nome do chamado pra tela de chat já vem do item clicado na listagem. Fora de escopo até que apareça um uso real.
+
+### Implementado (etapa 3, 2026-09-16) — listagem de chamados e followups (chat)
+
+Trabalho combinado por mensagem entre esta sessão (backbone) e duas sessões do app Android
+(Filament): uma implementando a UI de listagem/chat, outra testando na rede local. Contrato de
+API foi acertado entre as sessões antes de codar aqui.
+
+- **`GlpiTicket` no Prisma** (`prisma/schema.prisma`, migração `20260916120047_add_glpi_ticket_tracking`): tabela própria `(userId, glpiId, name, createdAt)` com `@@unique([userId, glpiId])`. Existe porque a API v2 do GLPI **não permite listar `Ticket` filtrando pelo ator** — `?filter=team.id==`/`?filter=team.role==` responde HTTP 500 (achado antigo, ainda válido). `POST /api/glpi/tickets` agora grava um registro aqui logo após criar o chamado no GLPI. `name` fica duplicado do GLPI só como fallback pra listagem.
+- **`GET /api/glpi/tickets`**: lê os vínculos da tabela própria pro usuário da sessão, enriquece cada um chamando `GET /Assistance/Ticket/{id}` no GLPI (best-effort — Promise.allSettled implícito via try/catch por item; se a consulta individual falhar, devolve `{id, name, status: null, date/date_mod: createdAt da tabela própria}` em vez de derrubar a listagem). Resposta: `{"tickets": [{id, name, status, date, date_mod}]}`.
+- **⚠️ Correção ao contrato combinado com o app: `status` não é int/string opaco.** Confirmado contra a instância real (`GET /Assistance/Ticket/{id}`): `status` vem como **objeto** `{"id": 1, "name": "Novo"}` — `id` é a constante ITIL numérica (1=Novo, 2=Processando/atribuído, 3=Processando/planejado, 4=Pendente, 5=Solucionado, 6=Fechado, 7=Aceito, 8=Observado, 10=Aprovação — via `CommonITILObject`, não documentado na doc pública da API), `name` já vem traduzido pelo GLPI (idioma default do usuário, ou `Accept-Language` se enviado). O client Android precisa parsear como `JSONObject`, não como primitivo.
+- **`GET`/`POST /api/glpi/tickets/{id}/followups`**: implementados em `listTicketFollowups`/`createTicketFollowup` (`src/lib/glpi.ts`) e nas rotas correspondentes. Path real confirmado contra a instância (2026-09-16): **`/Assistance/Ticket/{id}/Timeline/Followup`** — não `/Assistance/Ticket/{id}/ITILFollowup` (o padrão de `TeamMember` não se repete aqui; achado só dava pra confirmar consultando `GET /api.php/doc.json` da própria instância).
+- **⚠️ Segunda correção ao schema: a coleção vem envelopada, não plana.** `GET /Assistance/Ticket/{id}/Timeline/Followup` devolve `[{type: "Followup", item: {id, content, is_private, user, ...}}]`, não `[{id, content, ...}]` direto como o `doc.json` sugere. Só deu pra confirmar depois que o direito de leitura foi concedido (ver abaixo) — até lá a coleção sempre vinha vazia e escondia o shape real. `listTicketFollowups` já desembrulha (`entry.item`); é fácil reintroduzir esse bug lendo campo direto na raiz do item.
+- **Autorização por posse**: as duas rotas de followups (e só elas, por enquanto) checam se o `(userId da sessão, ticketId)` existe na tabela `GlpiTicket` antes de falar com o GLPI — 404 se não. Necessário porque o perfil de serviço "Bot" enxerga **todos os chamados da entidade** (`ver todos os chamados`, não só os do próprio usuário do app), então sem essa checagem qualquer usuário autenticado no app conseguiria ler/postar followups em chamados de terceiros só incrementando o id na URL.
+- **`authorEmail` em cada followup é best-effort**: o schema do `Followup` só embute `user: {id, name}`, sem e-mail. Pra cada autor único na lista, `listTicketFollowups` faz uma segunda chamada a `GET /Administration/User/{id}` (deduplicada, uma por autor distinto, não por followup) e usa o e-mail default. Falha nessa segunda chamada não derruba a listagem — só aquele item fica com `authorEmail: null`. Pra requerentes auto-provisionados (ver seção acima sobre `POST /Administration/User` ignorar `emails`) sempre vai vir `null`, porque esses usuários nascem sem e-mail no GLPI — limitação conhecida, não bug daqui.
+- **Atribuição do followup ao requerente, não à conta de serviço**: `createTicketFollowup` manda `user: {id: requesterUserId}` no corpo do `POST` (resolvido antes via `findOrCreateUserByEmail`, mesma função usada na criação do chamado). Sem isso, confirmado contra a instância real: o GLPI atribui o followup a quem está autenticado na API (a conta de serviço "filament"), não ao requerente — qualquer leitor veria o followup como se o bot tivesse escrito, não a pessoa. `user.id` não está marcado `readOnly` no schema published, e funciona como passado (mesma classe de achado do `id` do `TeamMember`, ver etapa 2).
+- **`POST /api/glpi/tickets/{id}/followups` não relê o followup criado no GLPI** — monta a resposta localmente a partir da sessão do Better Auth (`authorName`/`authorEmail` de quem está postando) e do `content` enviado. Isso é mais rápido (uma chamada em vez de duas) mas pode divergir de uma releitura posterior: pra requerentes auto-provisionados, o `user.name` que o GLPI devolve num `GET` é o `username` (aqui, o próprio e-mail), não o nome de exibição — então `authorName` pode aparecer como "Fulano de Tal" no eco local do envio e como "fulano@empresa.com" numa releitura. Esperado, não bug.
+
+### ✅ Bloqueio de direitos de leitura de followups — RESOLVIDO (2026-09-16)
+
+Detectado e corrigido no mesmo dia. Testado ponta a ponta contra a instância real (chamados
+#34, #36, #37, #38; usuários GLPI #17, #18, #21, #23 — **limpar manualmente**, o perfil "Bot"
+não tem direito de excluir):
+
+| Passo | Resultado (antes da correção) |
+|---|---|
+| `POST /Assistance/Ticket/{id}/Timeline/Followup` (público) | **201**, retorna `{id, href}` — criação confirmada |
+| `GET /Assistance/Ticket/{id}/Timeline/Followup` logo em seguida | **200 `[]`** — vazio, mesmo com followups reais recém-criados |
+| `GET .../Timeline/Followup/{subitem_id}` do item recém-criado | **404 `ERROR_ITEM_NOT_FOUND`** |
+| Forçar `GLPI-Profile: 10` (Bot) no header | mesmo resultado — não era o perfil ativo default sendo outro (a conta `filament` tem dois perfis: `9` "Padrão Elinsa" e `10` "Bot", confirmado via `GET /Session`) |
+
+**Diagnóstico:** o perfil "Bot" tinha direito de **criar** followups (a mesma seção "Acompanhamentos/Tarefas" citada na etapa da atribuição de requerente, onde só "Adicionar (requerente)" estava marcado), mas não tinha direito de **ver**. O GLPI não retorna 403 nesse caso — filtra silenciosamente os itens que o perfil não pode ver, tanto na coleção quanto no item individual. Ou seja, não tinha como o código distinguir "chamado sem followups" de "sem direito de ver followups" — os dois casos respondiam `200 {"followups": []}`.
+
+**Corrigido pelo usuário diretamente no GLPI** (direito de Ver em Acompanhamentos concedido ao perfil Bot). Reconfirmado no mesmo dia relendo os followups de teste: a coleção passou a devolver os itens reais, incluindo o envelope `{type, item}` (ver acima) e a exclusão correta de um followup privado de teste (`is_private: true` nunca aparece na resposta da API).
+
+**Chamados de teste criados que precisam limpeza manual no GLPI:** #36 (followups #5 público, #6 privado), #37 (followup #7 público), #38 (followups #8/#10/#11 públicos, #9 privado). Usuários de teste: `backbone-glpi-followup-test@example.invalid` (#21), `backbone-e2e-test-2@example.invalid` (#23).
 
 ### Status (2026-09-14)
 
