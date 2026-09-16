@@ -32,3 +32,5 @@ lerna-debug.log*
 .vercel
 
 .vercel
+
+/dist
