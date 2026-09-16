@@ -1,15 +1,18 @@
-// Client HTTP mínimo pra API REST v2 do GLPI (api.php/v2.3), sem lib externa — `fetch` já é
-// nativo no runtime do Hono/Node. Autenticação verificada via Context7 (`/glpi-project/glpi`,
-// resources/api_doc.MD): OAuth2, grant `client_credentials` só cobre o escopo `inventory` — pra
-// acessar recursos gerais (User, Ticket, ...) é obrigatório o grant `password`, autenticando uma
-// conta de usuário real. Por isso a conta de serviço precisa de usuário+senha no GLPI, não só de
-// um client_id/client_secret.
+// Client HTTP mínimo pra API REST legada do GLPI (apirest.php), sem lib externa — `fetch` já é
+// nativo no runtime do Hono/Node.
 //
-// Cada chamada pede um access_token novo (POST /api.php/token) e o usa direto — proposital: o
-// deploy é serverless na Vercel, sem estado persistente confiável entre invocações, então
-// cachear o token entre requests não é seguro. A doc do grant `password` não retorna
-// `refresh_token` (só o grant `authorization_code`, que exige login interativo do usuário e não
-// serve pra uma conta de serviço), então não há o que renovar — só pedir de novo.
+// Migrado da API v2 (api.php/v2.3, OAuth2) pra esta (etapa 4, 2026-09-16). Motivo: a v2 não
+// permite listar `Ticket` filtrando pelo ator (`?filter=team.id==` responde HTTP 500), então a
+// listagem dependia de uma tabela própria no Postgres — que nunca mostrava chamados abertos fora
+// do app (UI do GLPI, técnico). A legada resolve isso de verdade via `search.php` com
+// meta-critérios (o mesmo motor que a própria UI do GLPI usa), então a fonte de verdade passa a
+// ser sempre o GLPI, sem estado duplicado aqui. De brinde, ela também resolve outros atritos da
+// v2 (ver comentários nas funções abaixo): criar chamado com requerente numa chamada só, `emails`
+// gravado de verdade no usuário, followup sem envelope não documentado.
+//
+// Toda validação abaixo foi feita contra a instância real (helpdesk.elinsadobrasil.com.br,
+// 2026-09-16) — a doc pública da legada (`apirest.md`) cobre o formato geral, mas não os ids de
+// searchoption nem alguns comportamentos específicos desta instância.
 
 export class GlpiApiError extends Error {
   constructor(
@@ -21,132 +24,165 @@ export class GlpiApiError extends Error {
 }
 
 const GLPI_URL_API = process.env.GLPI_URL_API
-const GLPI_APP_CLIENT_ID = process.env.GLPI_APP_CLIENT_ID
-const GLPI_APP_CLIENT_SECRET = process.env.GLPI_APP_CLIENT_SECRET
+const GLPI_APP_TOKEN = process.env.GLPI_V1_API_KEY
 const GLPI_SERVICE_ACCOUNT_USERNAME = process.env.GLPI_SERVICE_ACCOUNT_USERNAME
 const GLPI_SERVICE_ACCOUNT_PASSWORD = process.env.GLPI_SERVICE_ACCOUNT_PASSWORD
 
-// GLPI_URL_API aponta pro root versionado dos recursos (.../api.php/v2.3), mas o endpoint de
-// token é a raiz não-versionada (.../api.php/token) — daí o strip do sufixo de versão aqui.
-const GLPI_API_ROOT = GLPI_URL_API?.replace(/\/v[\d.]+\/?$/, '')
+// GLPI_URL_API aponta pro root versionado da v2 (.../api.php/v2.3) por razões históricas (era o
+// necessário quando o projeto usava só a v2). A legada mora em .../apirest.php, uma raiz
+// irmã de .../api.php — daí o strip dos dois sufixos.
+const LEGACY_ROOT = GLPI_URL_API?.replace(/\/v[\d.]+\/?$/, '').replace(/\/api\.php\/?$/, '') + '/apirest.php'
 
-function resourceUrl(path: string): string {
-  return `${GLPI_URL_API}${path}`
-}
-
-function authUrl(path: string): string {
-  return `${GLPI_API_ROOT}${path}`
-}
-
-async function glpiFetch(url: string, init: RequestInit): Promise<unknown> {
+async function legacyFetch(url: string, init: RequestInit): Promise<unknown> {
   const response = await fetch(url, init)
   const text = await response.text()
-  const body = text ? JSON.parse(text) : null
+
+  let body: unknown = null
+  if (text) {
+    try {
+      body = JSON.parse(text)
+    } catch {
+      // Erros inesperados (ex.: query malformada) podem vir como página HTML de erro do GLPI,
+      // não JSON — guarda o texto truncado em vez de estourar no JSON.parse.
+      body = text.slice(0, 500)
+    }
+  }
 
   if (!response.ok) {
-    // Erros OAuth2 vêm como {"error": "...", "error_description": "..."}; erros dos recursos da
-    // API, como {"message": "..."}.
-    const message =
-      (body && typeof body === 'object' && ('error_description' in body || 'message' in body)
-        ? String(
-            (body as Record<string, unknown>).error_description ?? (body as Record<string, unknown>).message
-          )
-        : undefined) ?? text.trim() ?? `HTTP ${response.status}`
+    // Erros da API legada vêm como array de 2 posições: ["ERROR_CODE", "mensagem"]. Confirmado
+    // contra a instância real, inclusive pra erros de direito (ERROR_GLPI_DELETE) e de API
+    // desativada (["ERROR","API desativada"]).
+    const message = Array.isArray(body) && typeof body[1] === 'string' ? body[1] : typeof body === 'string' ? body : `HTTP ${response.status}`
     throw new GlpiApiError(response.status, message)
   }
 
   return body
 }
 
-async function getAccessToken(): Promise<string> {
-  const body = (await glpiFetch(authUrl('/token'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'password',
-      client_id: GLPI_APP_CLIENT_ID,
-      client_secret: GLPI_APP_CLIENT_SECRET,
-      username: GLPI_SERVICE_ACCOUNT_USERNAME,
-      password: GLPI_SERVICE_ACCOUNT_PASSWORD,
-      scope: 'api'
-    })
-  })) as { access_token?: string }
-
-  if (!body.access_token) {
-    throw new GlpiApiError(502, 'GLPI não retornou access_token')
-  }
-  return body.access_token
-}
-
-/** Pede um access_token só pra confirmar que a conta de serviço consegue autenticar. */
-export async function checkGlpiConnection(): Promise<boolean> {
-  await getAccessToken()
-  return true
-}
-
-/**
- * Executa uma chamada autenticada contra a API REST v2 do GLPI. `path` é relativo a
- * `GLPI_URL_API` e os recursos são namespaced (ex.: `/Administration/User`, `/Assistance/Ticket`),
- * não nomes soltos como na API legada.
- *
- * `Content-Type` só vai quando há corpo: em requisição sem corpo o GLPI tenta interpretar o corpo
- * vazio como JSON e responde 400 "Corpo JSON inválido" (confirmado contra a instância real).
- */
-export async function glpiRequest(method: string, path: string, opts?: { body?: unknown }): Promise<unknown> {
-  const accessToken = await getAccessToken()
-  return glpiFetch(resourceUrl(path), {
-    method,
+async function initSession(): Promise<string> {
+  const basicAuth = Buffer.from(`${GLPI_SERVICE_ACCOUNT_USERNAME}:${GLPI_SERVICE_ACCOUNT_PASSWORD}`).toString('base64')
+  const body = (await legacyFetch(`${LEGACY_ROOT}/initSession`, {
+    method: 'GET',
     headers: {
-      Authorization: `Bearer ${accessToken}`,
-      ...(opts?.body ? { 'Content-Type': 'application/json' } : {})
-    },
-    body: opts?.body ? JSON.stringify(opts.body) : undefined
+      Authorization: `Basic ${basicAuth}`,
+      ...(GLPI_APP_TOKEN ? { 'App-Token': GLPI_APP_TOKEN } : {})
+    }
+  })) as { session_token?: string }
+
+  if (!body.session_token) {
+    throw new GlpiApiError(502, 'GLPI não retornou session_token')
+  }
+  return body.session_token
+}
+
+async function killSession(sessionToken: string): Promise<void> {
+  await legacyFetch(`${LEGACY_ROOT}/killSession`, {
+    method: 'GET',
+    headers: {
+      'Session-Token': sessionToken,
+      ...(GLPI_APP_TOKEN ? { 'App-Token': GLPI_APP_TOKEN } : {})
+    }
   })
 }
 
+type GlpiCall = (method: string, path: string, opts?: { body?: unknown }) => Promise<unknown>
+
 /**
- * Busca um usuário do GLPI pelo e-mail, em duas tentativas — e as duas são necessárias:
+ * Abre uma sessão (`initSession`), executa `fn` com uma função `call` já autenticada com ela, e
+ * garante o `killSession` no final (best-effort — se o encerramento falhar, só loga, não derruba
+ * o resultado de `fn`). Uma sessão por operação (não por chamada individual): funções que
+ * precisam de mais de uma chamada ao GLPI (ex. [findUserByEmail], [listTicketFollowups])
+ * compartilham a mesma sessão internamente em vez de abrir uma nova a cada requisição.
  *
- * 1. `emails.email==` acha quem foi cadastrado pelo GLPI (funcionários de verdade), que têm o
- *    e-mail na relação `emails`.
- * 2. `username==` acha quem foi criado por esta integração. Motivo: o `POST /Administration/User`
- *    **ignora silenciosamente** o array `emails` do corpo — responde 201 como se tivesse gravado,
- *    mas o usuário nasce com `emails: []` (confirmado em teste real). E a API v2 não expõe
- *    endpoint pra definir o e-mail de outro usuário (só `/User/Me/Email`, do próprio autenticado).
- *    Como [createUser] grava o e-mail no `username`, é por ele que dá pra reencontrar.
+ * Sem cache de sessão entre invocações — mesmo raciocínio documentado desde a v2: deploy
+ * serverless na Vercel não tem estado confiável entre requests pra isso ser seguro.
+ */
+async function withGlpiSession<T>(fn: (call: GlpiCall) => Promise<T>): Promise<T> {
+  const sessionToken = await initSession()
+  const call: GlpiCall = (method, path, opts) =>
+    legacyFetch(`${LEGACY_ROOT}${path}`, {
+      method,
+      headers: {
+        'Session-Token': sessionToken,
+        ...(GLPI_APP_TOKEN ? { 'App-Token': GLPI_APP_TOKEN } : {}),
+        ...(opts?.body ? { 'Content-Type': 'application/json' } : {})
+      },
+      body: opts?.body ? JSON.stringify(opts.body) : undefined
+    })
+
+  try {
+    return await fn(call)
+  } finally {
+    await killSession(sessionToken).catch((error) => console.error('Falha ao encerrar sessão do GLPI (não crítico):', error))
+  }
+}
+
+/** Pede uma sessão só pra confirmar que a conta de serviço consegue autenticar. */
+export async function checkGlpiConnection(): Promise<boolean> {
+  await withGlpiSession(async () => {})
+  return true
+}
+
+// GLPI devolve datetime "naive" (sem timezone), ex. "2026-09-16 10:07:37" — assume-se o timezone
+// configurado na instância (América/São_Paulo, -03:00). Confirmado indiretamente: os timestamps
+// da v2 (que devolvia ISO-8601 completo) sempre vinham com esse offset, e o Brasil não usa mais
+// horário de verão desde 2019, então o offset fixo é seguro aqui.
+function toIsoDateTime(glpiDatetime: string | null | undefined): string | null {
+  if (!glpiDatetime) return null
+  return `${glpiDatetime.replace(' ', 'T')}-03:00`
+}
+
+/**
+ * Busca um usuário do GLPI pelo e-mail, em duas tentativas (mesma lógica da v2, ainda necessária
+ * aqui): `UserEmail` (searchoption 5) acha quem foi cadastrado pelo GLPI (funcionários de
+ * verdade); `User.name`/username (searchoption 1) acha quem foi criado por esta integração —
+ * diferente da v2, `createUser` aqui GRAVA o e-mail de verdade (ver [createUser]), mas o
+ * `username` continua sendo o e-mail por convenção, então a segunda tentativa ainda serve de
+ * fallback caso o e-mail não tenha sido gravado por algum motivo.
  *
- * Sem a segunda tentativa, a busca nunca acha quem a própria integração criou e cada chamado
- * novo geraria um usuário duplicado no GLPI.
+ * `searchtype=equals` não funciona pra estes campos nesta instância (campos dropdown/itemlink —
+ * "equals" parece comparar contra o id resolvido, não o texto; confirmado com resultado vazio
+ * mesmo pra valor existente). Usa `contains` (funciona) e filtra client-side por igualdade exata
+ * (case-insensitive) pra evitar falso positivo de substring.
  */
 export async function findUserByEmail(email: string): Promise<{ id: number } | null> {
-  const encoded = encodeURIComponent(email)
+  return withGlpiSession(async (call) => {
+    const encoded = encodeURIComponent(email)
+    const normalized = email.toLowerCase()
 
-  const byEmail = (await glpiRequest(
-    'GET',
-    `/Administration/User?filter=emails.email==${encoded}&limit=1`
-  )) as Array<{ id: number }> | null
-  if (byEmail?.[0]) return byEmail[0]
+    const byEmail = (await call(
+      'GET',
+      `/search/User?criteria[0][field]=5&criteria[0][searchtype]=contains&criteria[0][value]=${encoded}&forcedisplay[0]=2&forcedisplay[1]=5`
+    )) as { data?: Array<{ '2': number; '5': string }> }
+    const emailMatch = byEmail.data?.find((row) => row['5']?.toLowerCase() === normalized)
+    if (emailMatch) return { id: emailMatch['2'] }
 
-  const byUsername = (await glpiRequest(
-    'GET',
-    `/Administration/User?filter=username==${encoded}&limit=1`
-  )) as Array<{ id: number }> | null
-  return byUsername?.[0] ?? null
+    const byUsername = (await call(
+      'GET',
+      `/search/User?criteria[0][field]=1&criteria[0][searchtype]=contains&criteria[0][value]=${encoded}&forcedisplay[0]=2&forcedisplay[1]=1`
+    )) as { data?: Array<{ '2': number; '1': string }> }
+    const usernameMatch = byUsername.data?.find((row) => row['1']?.toLowerCase() === normalized)
+    return usernameMatch ? { id: usernameMatch['2'] } : null
+  })
 }
 
 /**
  * Cria um usuário no GLPI a partir do e-mail. Sem senha de propósito: essa conta nunca é usada
  * pra login — existe só pra o chamado ter o requerente certo em vez da conta de serviço.
  *
- * O `username` recebe o e-mail porque é o único campo que a API grava de fato (ver [findUserByEmail]).
- * Consequência conhecida: o usuário fica **sem endereço de e-mail** no GLPI, então o GLPI não
- * consegue notificá-lo por e-mail sobre o chamado — quem for atender precisa preencher isso na UI,
- * ou o e-mail precisa vir de outra fonte (LDAP/sync).
+ * **Diferente da v2**: `_useremails` aqui GRAVA o e-mail de verdade (confirmado contra a
+ * instância real via `GET /User/{id}/UserEmail`), diferente do `POST /Administration/User` da v2
+ * que ignorava o array `emails` silenciosamente. Isso resolve a limitação que a v2 tinha
+ * (requerente auto-provisionado sem e-mail, sem notificação do GLPI) — usuários criados por esta
+ * função a partir de agora têm e-mail de verdade.
  */
 export async function createUser(params: { email: string; displayName: string }): Promise<{ id: number }> {
-  return (await glpiRequest('POST', '/Administration/User', {
-    body: { username: params.email, firstname: params.displayName }
-  })) as { id: number }
+  return withGlpiSession(async (call) => {
+    const created = (await call('POST', '/User', {
+      body: { input: { name: params.email, firstname: params.displayName, _useremails: [params.email] } }
+    })) as { id: number }
+    return { id: created.id }
+  })
 }
 
 export async function findOrCreateUserByEmail(email: string, displayName: string): Promise<{ id: number }> {
@@ -154,160 +190,174 @@ export async function findOrCreateUserByEmail(email: string, displayName: string
 }
 
 /**
- * Cria um chamado e atribui o requerente numa segunda chamada — no GLPI o ator é um sub-recurso
- * (`TeamMember`), não um campo do próprio ticket. Sem isso o chamado sairia como se a conta de
- * serviço fosse a pessoa que pediu.
- *
- * O campo que identifica o usuário é `id` — confirmado em teste real. O schema auto-gerado do
- * GLPI marca esse `id` como `readOnly` (ou seja, a doc diz que ele não é aceito na escrita), mas
- * é justamente ele que funciona: `items_id` e `users_id`, que seriam o padrão do resto da API,
- * respondem **500**. Não "corrigir" isso pra items_id sem testar de novo contra a instância.
- *
- * O chamado é criado antes desta segunda chamada, então uma falha aqui deixa um chamado sem
- * requerente no GLPI (o GLPI não atribui a conta de serviço por padrão — o chamado nasce sem
- * ator nenhum) e o erro sobe pro app.
+ * Cria um chamado já atribuído ao requerente, numa única chamada — `_users_id_requester` no
+ * input do `Ticket` faz o GLPI criar o ator numa tacada só. **Diferente da v2**, que exigia uma
+ * segunda chamada (`POST .../TeamMember`) porque a API v2 trata o ator como sub-recurso separado;
+ * confirmado contra a instância real que `_users_id_requester` funciona (`GET .../Ticket_User`
+ * mostra `type:1` — requerente — com o `users_id` certo).
  */
 export async function createTicketForRequester(params: {
   requesterUserId: number
   name: string
   content: string
 }): Promise<{ id: number }> {
-  const ticket = (await glpiRequest('POST', '/Assistance/Ticket', {
-    body: { name: params.name, content: params.content }
-  })) as { id: number }
-
-  await glpiRequest('POST', `/Assistance/Ticket/${ticket.id}/TeamMember`, {
-    body: { type: 'User', id: params.requesterUserId, role: 'requester' }
+  return withGlpiSession(async (call) => {
+    const created = (await call('POST', '/Ticket', {
+      body: { input: { name: params.name, content: params.content, _users_id_requester: params.requesterUserId } }
+    })) as { id: number }
+    return { id: created.id }
   })
-
-  return ticket
 }
 
 export interface GlpiTicketSummary {
   id: number
   name: string
-  status: unknown
-  date: string
-  date_mod: string
+  status: { id: number; name: string }
+  date: string | null
+  date_mod: string | null
+}
+
+// Nomes traduzidos dos status ITIL padrão (constantes de `CommonITILObject`, confirmadas contra
+// a instância real na etapa anterior). A legada devolve só o código numérico no `search`
+// (searchoption 12, datatype "specific" — sem tradução automática, diferente da v2 que já
+// devolvia `{id, name}` pronto), então a tradução agora é responsabilidade daqui.
+const TICKET_STATUS_NAMES: Record<number, string> = {
+  1: 'Novo',
+  2: 'Processando (atribuído)',
+  3: 'Processando (planejado)',
+  4: 'Pendente',
+  5: 'Solucionado',
+  6: 'Fechado',
+  7: 'Aceito',
+  8: 'Observado',
+  10: 'Aprovação'
 }
 
 /**
- * Busca um chamado pelo id. Usado pra enriquecer a listagem (que vem da tabela própria no
- * Postgres, não do GLPI — ver NOTES.md) com os dados atuais do GLPI: status, datas.
+ * Lista os chamados de um requerente via `search/Ticket` com o searchoption 4 ("Requerente",
+ * `Ticket.Ticket_User.User.name`) — o mesmo motor de busca que a UI do GLPI usa, confirmado
+ * contra a instância real que filtra corretamente por ator. Substitui a tabela `GlpiTicket` que
+ * existia no Postgres só por causa da limitação da v2 (ver histórico no topo do arquivo): agora
+ * o GLPI é sempre a fonte de verdade, então chamados abertos fora do app também aparecem.
  *
- * `status` é devolvido como veio do GLPI — na instância real é um objeto `{id, name}` (id é a
- * constante ITIL numérica: 1=Novo, 2=Processando/atribuído, 3=Processando/planejado, 4=Pendente,
- * 5=Solucionado, 6=Fechado; `name` já vem traduzido pelo GLPI), não um valor opaco int/string.
- * Confirmado contra a instância real (2026-09-16), não documentado na doc pública da API.
+ * `range=0-499` é um teto pragmático (sem paginação real) — suficiente pro volume esperado de um
+ * único requerente; revisitar se algum usuário passar disso.
  */
-export async function getTicket(id: number): Promise<GlpiTicketSummary> {
-  return (await glpiRequest('GET', `/Assistance/Ticket/${id}`)) as GlpiTicketSummary
+export async function listTicketsForRequester(requesterUserId: number): Promise<GlpiTicketSummary[]> {
+  return withGlpiSession(async (call) => {
+    const qs =
+      `criteria[0][field]=4&criteria[0][searchtype]=equals&criteria[0][value]=${requesterUserId}` +
+      `&forcedisplay[0]=2&forcedisplay[1]=1&forcedisplay[2]=12&forcedisplay[3]=15&forcedisplay[4]=19&range=0-499`
+    const result = (await call('GET', `/search/Ticket?${qs}`)) as { data?: Array<Record<string, string | number>> }
+
+    return (result.data ?? []).map((row) => {
+      const statusId = Number(row['12'])
+      return {
+        id: Number(row['2']),
+        name: String(row['1']),
+        status: { id: statusId, name: TICKET_STATUS_NAMES[statusId] ?? String(statusId) },
+        date: toIsoDateTime(row['15'] as string),
+        date_mod: toIsoDateTime(row['19'] as string)
+      }
+    })
+  })
+}
+
+/**
+ * Confirma se um chamado pertence a um requerente, via `search/Ticket` com dois critérios (id do
+ * chamado E requerente). Substitui a checagem de posse que antes vinha da tabela própria no
+ * Postgres — agora consulta o GLPI direto, então não depende de o chamado ter sido criado pelo
+ * app. Usada como gate de autorização nas rotas de followups (ver `src/routes/glpi.ts`): o perfil
+ * de serviço enxerga todos os chamados da entidade, então sem essa checagem qualquer usuário
+ * autenticado no app leria/postaria em chamado de terceiros.
+ */
+export async function ticketBelongsToRequester(ticketId: number, requesterUserId: number): Promise<boolean> {
+  return withGlpiSession(async (call) => {
+    const qs =
+      `criteria[0][field]=2&criteria[0][searchtype]=equals&criteria[0][value]=${ticketId}` +
+      `&criteria[1][link]=AND&criteria[1][field]=4&criteria[1][searchtype]=equals&criteria[1][value]=${requesterUserId}`
+    const result = (await call('GET', `/search/Ticket?${qs}`)) as { totalcount?: number }
+    return (result.totalcount ?? 0) > 0
+  })
 }
 
 export interface GlpiFollowup {
   id: number
   content: string
-  date: string
+  date: string | null
   authorName: string | null
   authorEmail: string | null
   isPrivate: boolean
 }
 
 /**
- * Lista os followups (acompanhamentos) públicos de um chamado.
+ * Lista os followups públicos de um chamado via `GET /Ticket/{id}/ITILFollowup`.
  *
- * Path real confirmado contra a instância (2026-09-16): `/Assistance/Ticket/{id}/Timeline/Followup`
- * — não `/Assistance/Ticket/{id}/ITILFollowup` (o padrão usado por `TeamMember` não se repete
- * aqui). O schema published (`GET /api.php/doc.json`) chama o recurso de `Followup`
- * (`x-itemtype: ITILFollowup`).
+ * **Diferente da v2**: a coleção vem plana (`[{id, content, is_private, users_id, ...}]`), sem o
+ * envelope `{type, item}` não documentado que a v2 tinha. E o mesmo direito de leitura
+ * (Acompanhamentos > Ver, concedido ao perfil "Bot" na etapa anterior) vale aqui — é o mesmo
+ * sistema de permissões por baixo das duas APIs, confirmado sem bloqueio novo.
  *
- * **Cada item vem envelopado, não plano** — `[{type: "Followup", item: {id, content, is_private,
- * user, ...}}]`, não `[{id, content, ...}]` direto como o schema do `doc.json` sugere. Só foi
- * possível confirmar isso depois que o direito de leitura foi concedido no perfil "Bot" (ver
- * histórico abaixo) — até lá a coleção sempre vinha vazia e não dava pra ver o shape real. Ler o
- * campo errado (ex.: `followup.is_private` em vez de `followup.item.is_private`) dá `undefined`,
- * que passa no filtro de privacidade sem erro — ou seja, um followup **privado vazaria pro
- * requerente**. Cuidado ao mexer aqui: testar sempre com um followup privado de verdade na
- * resposta, não só checar o `status` HTTP.
- *
- * `authorEmail` é best-effort: o followup só embute `user: {id, name}` (sem e-mail), então pra
- * cada autor único é feita uma segunda chamada a `/Administration/User/{id}`. Falha nessa segunda
- * chamada não derruba a listagem inteira — só aquele item fica com `authorEmail: null`. E pra
- * requerentes auto-provisionados (ver [findOrCreateUserByEmail]) sempre vai vir `null`, porque
- * esses usuários nascem sem e-mail no GLPI — limitação conhecida, não bug daqui.
- *
- * **Histórico do bloqueio de direitos (2026-09-16, resolvido):** o perfil "Bot" tinha direito de
- * criar followup (herdado do direito de Chamados) mas não de ver — só "Adicionar (requerente)"
- * estava marcado na aba Chamados > Acompanhamentos/Tarefas, não "Ver". `POST` respondia 201
- * normalmente, mas `GET` da coleção devolvia `[]` mesmo com followups reais gravados, e
- * `GET .../Timeline/Followup/{subitem_id}` do item recém-criado respondia 404
- * `ERROR_ITEM_NOT_FOUND` — o GLPI filtra silenciosamente o que o perfil não pode ver, não dá 403.
- * Corrigido no GLPI (perfil Bot, direito de Ver em Acompanhamentos concedido) — confirmado
- * funcionando no mesmo dia, relendo os followups de teste criados durante a investigação.
+ * `authorName`/`authorEmail` exigem uma segunda (e terceira) chamada por autor único — o
+ * followup só traz `users_id` (número), sem nome nem e-mail embutidos. `authorName` prioriza
+ * `firstname`+`realname` (mais legível) e cai pro `name` (username) se nenhum dos dois existir —
+ * pra requerentes auto-provisionados isso já é o nome de exibição real (ver [createUser]), não
+ * mais o e-mail cru como acontecia na v2. Falha na busca de um autor não derruba a listagem
+ * inteira, só deixa aquele item com `authorName`/`authorEmail` nulos.
  */
 export async function listTicketFollowups(ticketId: number): Promise<GlpiFollowup[]> {
-  const raw = (await glpiRequest('GET', `/Assistance/Ticket/${ticketId}/Timeline/Followup`)) as Array<{
-    type: string
-    item: {
+  return withGlpiSession(async (call) => {
+    const raw = (await call('GET', `/Ticket/${ticketId}/ITILFollowup`)) as Array<{
       id: number
       content: string
       date: string
-      is_private: boolean
-      user?: { id: number; name: string | null } | null
-    }
-  }>
+      is_private: number | boolean
+      users_id: number
+    }> | null
 
-  const publicFollowups = (raw ?? []).map((entry) => entry.item).filter((followup) => !followup.is_private)
+    const publicFollowups = (raw ?? []).filter((followup) => !followup.is_private)
 
-  const authorIds = [
-    ...new Set(publicFollowups.map((followup) => followup.user?.id).filter((id): id is number => typeof id === 'number'))
-  ]
-
-  const emailByAuthorId = new Map<number, string | null>()
-  await Promise.all(
-    authorIds.map(async (authorId) => {
-      try {
-        const user = (await glpiRequest('GET', `/Administration/User/${authorId}`)) as {
-          emails?: Array<{ email: string; is_default?: boolean }>
+    const authorIds = [...new Set(publicFollowups.map((followup) => followup.users_id).filter((id) => id > 0))]
+    const authorById = new Map<number, { name: string | null; email: string | null }>()
+    await Promise.all(
+      authorIds.map(async (authorId) => {
+        try {
+          const [user, emails] = await Promise.all([
+            call('GET', `/User/${authorId}`) as Promise<{ name?: string; firstname?: string | null; realname?: string | null }>,
+            call('GET', `/User/${authorId}/UserEmail`) as Promise<Array<{ email: string; is_default?: number | boolean }> | null>
+          ])
+          const displayName = [user.firstname, user.realname].filter(Boolean).join(' ').trim() || user.name || null
+          const email = emails?.find((e) => e.is_default)?.email ?? emails?.[0]?.email ?? null
+          authorById.set(authorId, { name: displayName, email })
+        } catch (error) {
+          console.error(`Falha ao buscar autor ${authorId} do followup:`, error)
+          authorById.set(authorId, { name: null, email: null })
         }
-        const email = user.emails?.find((e) => e.is_default)?.email ?? user.emails?.[0]?.email ?? null
-        emailByAuthorId.set(authorId, email)
-      } catch (error) {
-        console.error(`Falha ao buscar e-mail do autor ${authorId} do followup:`, error)
-        emailByAuthorId.set(authorId, null)
-      }
-    })
-  )
+      })
+    )
 
-  return publicFollowups.map((followup) => ({
-    id: followup.id,
-    content: followup.content,
-    date: followup.date,
-    authorName: followup.user?.name ?? null,
-    authorEmail: followup.user?.id != null ? (emailByAuthorId.get(followup.user.id) ?? null) : null,
-    isPrivate: false
-  }))
+    return publicFollowups.map((followup) => ({
+      id: followup.id,
+      content: followup.content,
+      date: toIsoDateTime(followup.date),
+      authorName: authorById.get(followup.users_id)?.name ?? null,
+      authorEmail: authorById.get(followup.users_id)?.email ?? null,
+      isPrivate: false
+    }))
+  })
 }
 
 /**
- * Cria um followup público num chamado, atribuído ao requerente (não à conta de serviço).
- *
- * `user: {id: requesterUserId}` no corpo é necessário — sem ele, o GLPI atribui o followup a quem
- * está autenticado na API (a conta de serviço "filament"), então o followup apareceria de volta
- * pra qualquer outro leitor como se o bot tivesse escrito, não o requerente. Confirmado contra a
- * instância real (2026-09-16): sem o campo, `GET` mostra `user: {id: 16, name: "filament"}`;
- * com o campo, mostra o usuário certo. `requesterUserId` é o mesmo id resolvido por
- * [findOrCreateUserByEmail] (o `User` do GLPI correspondente ao e-mail da sessão do app).
+ * Cria um followup público num chamado, atribuído ao requerente. **Diferente da v2**:
+ * `users_id` no input do `POST /ITILFollowup` já atribui certo numa chamada só, sem o trâmite
+ * que a v2 precisava. Confirmado contra a instância real (`GET .../ITILFollowup` mostra o
+ * `users_id` certo, não a conta de serviço).
  *
  * A resposta é montada localmente a partir da sessão do Better Auth (`authorName`/`authorEmail`
- * do próprio usuário que está postando) em vez de reler o followup criado no GLPI — mantém o
- * `POST` rápido (uma chamada em vez de duas) e não depende de o `GET` de followups estar
- * funcionando. Note que isso pode divergir do que um `GET` posterior mostra: pra requerentes
- * auto-provisionados (sem e-mail gravado no GLPI, ver [findOrCreateUserByEmail]), o `user.name`
- * que o GLPI devolve na releitura é o `username` (que aqui é o próprio e-mail), não o nome de
- * exibição — então `authorName` pode aparecer como "Fulano de Tal" logo após o envio (eco local)
- * e como "fulano@empresa.com" numa releitura posterior (vindo do GLPI). Comportamento esperado,
- * não bug — documentado também em [listTicketFollowups].
+ * do próprio usuário que está postando) em vez de reler o followup criado — mais rápido (uma
+ * chamada em vez de duas). Assim como documentado antes: pode divergir um pouco de uma releitura
+ * posterior via [listTicketFollowups], que usa `firstname`/`realname` do GLPI em vez do nome da
+ * sessão do app — normalmente o mesmo texto, já que [createUser] grava o `firstname` a partir daí.
  */
 export async function createTicketFollowup(
   ticketId: number,
@@ -315,16 +365,18 @@ export async function createTicketFollowup(
   author: { name: string; email: string },
   requesterUserId: number
 ): Promise<GlpiFollowup> {
-  const created = (await glpiRequest('POST', `/Assistance/Ticket/${ticketId}/Timeline/Followup`, {
-    body: { content, user: { id: requesterUserId } }
-  })) as { id: number }
+  return withGlpiSession(async (call) => {
+    const created = (await call('POST', '/ITILFollowup', {
+      body: { input: { itemtype: 'Ticket', items_id: ticketId, content, users_id: requesterUserId } }
+    })) as { id: number }
 
-  return {
-    id: created.id,
-    content,
-    date: new Date().toISOString(),
-    authorName: author.name,
-    authorEmail: author.email,
-    isPrivate: false
-  }
+    return {
+      id: created.id,
+      content,
+      date: new Date().toISOString(),
+      authorName: author.name,
+      authorEmail: author.email,
+      isPrivate: false
+    }
+  })
 }

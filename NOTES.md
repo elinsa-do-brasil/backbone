@@ -1,7 +1,7 @@
 ## Integração com o GLPI (helpdesk.elinsadobrasil.com.br)
 
 - **Proxy via backend, não o app direto**: as credenciais do GLPI (`GLPI_APP_CLIENT_SECRET`, senha da conta de serviço) não podem ficar no dispositivo/APK. O app (`filament`) chama `/api/glpi/*` aqui no `backbone`, autenticado com o mesmo bearer token do Better Auth; quem fala com o GLPI é só este backend.
-- **API v2 do GLPI (`api.php/v2.3`), OAuth2** — não a API legada (`apirest.php`, `App-Token`/`user_token`). Verificado via Context7 (`/glpi-project/glpi`).
+- **⚠️ Desde a etapa 4 (2026-09-16), a integração usa a API REST legada (`apirest.php`), não mais a v2.** As seções abaixo sobre a v2 (OAuth2, `/Assistance/Ticket`, etc.) ficam como registro histórico de decisões e achados — várias ainda são relevantes (ex.: direitos do perfil Bot, formato de erro geral), mas o client atual (`src/lib/glpi.ts`) não fala mais v2. Ver "Migração pra API legada (etapa 4)" no fim deste arquivo pro estado atual.
 - **Conta de serviço única, grant `password`**: o grant `client_credentials` do GLPI só cobre o escopo `inventory` — acessar recursos gerais (`User`, `Ticket`) exige autenticar um usuário real via grant `password` (`client_id` + `client_secret` do cliente OAuth2 registrado, mais usuário/senha de uma conta técnica). Em vez de mapear login do app → login do GLPI (são sistemas diferentes), todas as chamadas usam essa conta de serviço única. Quando a feature de chamados for implementada, o requerente de cada ticket será resolvido buscando/criando um `User` no GLPI pelo e-mail do usuário logado no app — ainda não implementado.
 - **Token por chamada, sem cache**: `src/lib/glpi.ts` pede um `access_token` novo a cada `glpiRequest`/`checkGlpiConnection`. Proposital — deploy serverless na Vercel não tem estado confiável entre invocações pra cachear o token com segurança, e o grant `password` não retorna `refresh_token` (só o grant `authorization_code`, que exige login interativo e não serve pra conta de serviço).
 - Endpoint desta etapa: `GET /api/glpi/status` (`src/routes/glpi.ts`), só confirma que o backend consegue autenticar a conta de serviço no GLPI. Nenhum dado real do GLPI é exposto ainda.
@@ -98,3 +98,102 @@ não tem direito de excluir):
 - **Testado de ponta a ponta**: grant `password` contra o GLPI real retornou `access_token` (HTTP 200) com essas credenciais. `GET /api/glpi/status` sem sessão retorna 401 corretamente (rota montada, gate do Better Auth funcionando). Ainda não testado com uma sessão real (esperado retornar `{connected: true}`).
 - **`src/index.ts` — montagem de `app.route('/api/glpi', glpiRoutes)` feita localmente mas AINDA NÃO COMMITADA**: esse arquivo está compartilhado com outro trabalho em andamento no mesmo checkout (native-app-schemes/passkey, de outra sessão), então o commit da integração GLPI não inclui essa linha pra não empacotar código alheio ainda não revisado. Quem for continuar precisa adicionar essas duas linhas a `src/index.ts` (import de `glpiRoutes` de `./routes/glpi.js` + `app.route('/api/glpi', glpiRoutes)` logo após `app.all('/api/auth/*', ...)`) — ou commitar depois que o outro trabalho for commitado primeiro.
 - Próximo passo natural: busca/auto-provisionamento de `User` por e-mail e CRUD de `Ticket` (ainda fora de escopo).
+
+## Migração pra API legada (etapa 4, 2026-09-16)
+
+**Motivo:** a v2 nunca resolveu listar `Ticket` filtrando pelo ator (HTTP 500), o que forçava uma
+tabela própria no Postgres (`GlpiTicket`, etapa 3) — que por sua vez nunca mostrava chamados
+abertos fora do app (UI do GLPI, técnico em nome do usuário). Avaliado trocar pra API legada
+(`apirest.php`) especificamente por causa disso: ela expõe o motor de busca (`search.php`) que a
+própria UI do GLPI usa, com meta-critérios entre itemtypes — resolve o filtro por ator de
+verdade. Confirmado empiricamente ponta a ponta antes de migrar (não só pela doc — este projeto
+já foi mordido por doc errada da v2 mais de uma vez).
+
+De brinde, a legada também resolveu outros atritos que a v2 tinha (todos confirmados contra a
+instância real, chamados/usuários de teste #40/#41, #24 — **limpar manualmente**, perfil Bot sem
+direito de excluir):
+
+| Problema na v2 | Como a legada resolve |
+|---|---|
+| Requerente exigia 2 chamadas (`Ticket` + `TeamMember`) | `_users_id_requester` no input do `POST /Ticket` já atribui numa chamada só |
+| `POST /Administration/User` ignorava `emails[]` silenciosamente | `_useremails` no input do `POST /User` grava de verdade (confirmado via `GET /User/{id}/UserEmail`) — usuário auto-provisionado passa a ter e-mail real no GLPI |
+| Followup exigia atribuição indireta, senão virava a conta de serviço | `users_id` no input do `POST /ITILFollowup` atribui direto |
+| Coleção de followup vinha envelopada (`{type, item}`), não documentado | `GET /Ticket/{id}/ITILFollowup` é uma lista plana, como a doc diz |
+| Sem filtro de `Ticket` por ator (500) | `search/Ticket` com `criteria[field=4]` (ver abaixo) |
+
+### Autenticação: `initSession`/`Session-Token`, não mais OAuth2
+
+- `POST apirest.php/initSession` com `Authorization: Basic base64(username:password)` (reaproveita
+  `GLPI_SERVICE_ACCOUNT_USERNAME`/`PASSWORD`, já existiam) + header `App-Token` (novo:
+  `GLPI_V1_API_KEY`, gerado em Configurar > Geral > API > Cliente API REST). Existe também a opção
+  `user_token` (gerado no perfil do próprio usuário, revogável sem trocar senha — mais seguro que
+  Basic Auth com a senha real) — não usada por ora, mas é uma melhoria futura fácil se quiser
+  reduzir a exposição da senha da conta de serviço.
+- **A API legada precisou ser habilitada manualmente** (Configurar > Geral > API) — vinha
+  desativada por padrão nesta instância (`GET /initSession` sem isso responde 400
+  `["ERROR","API desativada"]`).
+- **Uma sessão por operação, não por chamada individual.** `withGlpiSession()` em `src/lib/glpi.ts`
+  abre uma sessão, compartilha ela entre todas as chamadas que uma função de alto nível precisa
+  (ex.: `findUserByEmail` faz duas buscas na mesma sessão), e sempre fecha com `killSession` no
+  final (best-effort — falha ao fechar não derruba o resultado). Ainda sem cache de sessão entre
+  invocações — mesmo motivo de sempre: serverless na Vercel não tem estado confiável pra isso.
+- **Formato de erro mudou**: a legada devolve `["ERROR_CODE", "mensagem"]` (array de 2 posições)
+  em vez do `{message: "..."}"`/`{error_description: "..."}` da v2. `legacyFetch()` já trata isso.
+
+### `search/Ticket` — o motivo real da migração
+
+- Campo de requerente descoberto via `GET /listSearchOptions/Ticket`: **`field=4`**
+  (`Ticket.Ticket_User.User.name`, tabela `glpi_users`). Outros campos usados:
+  `1`=Título, `2`=ID, `12`=Status (código cru, sem tradução), `15`=Data de abertura (`date`),
+  `19`=Última atualização (`date_mod`).
+- Query: `GET /search/Ticket?criteria[0][field]=4&criteria[0][searchtype]=equals&criteria[0][value]=<id>&forcedisplay[...]`.
+  **Cuidado com a serialização da query** — tem que ser array-style de PHP
+  (`criteria[0][field]=...`), não uma string JSON num query param; e os *valores* (não as chaves)
+  precisam de `encodeURIComponent`, senão a instância responde **500 com página HTML de erro**
+  (não JSON) — foi assim que descobri os dois bugs, um de cada vez.
+- **`searchtype=equals` não funciona em campos dropdown/itemlink** (`Ticket.status`,
+  `User.name`, `User.UserEmail.email`) — confirmado contra a instância real, devolve `totalcount:0`
+  mesmo pra valor existente (parece comparar contra o id resolvido internamente, não o texto).
+  Usa `searchtype=contains` (funciona) e filtra client-side por igualdade exata — só `field=4`
+  (Ticket.Ticket_User, não itemlink em si) aceita `equals` de verdade, confirmado com resultado
+  correto.
+- **Chamados na lixeira (`is_deleted=1`) não aparecem em `search` por padrão** — comportamento
+  normal do GLPI (mesmo que a UI), não bug. Se algum dia precisar buscar incluindo lixeira, manda
+  `&is_deleted=1` na query.
+- `status` (searchoption 12) vem como **código numérico cru**, sem tradução — diferente da v2 que
+  dava `{id, name}` de graça. A tradução agora é responsabilidade daqui (`TICKET_STATUS_NAMES` em
+  `src/lib/glpi.ts`, os mesmos códigos ITIL já documentados na etapa 3).
+- Datas (`date`/`date_mod`) vêm como string "naive" (`"2026-09-16 10:07:37"`, sem timezone) —
+  `toIsoDateTime()` assume `-03:00` (América/São_Paulo, mesmo timezone que a v2 sempre devolveu
+  explícito, e o Brasil não usa mais horário de verão desde 2019).
+
+### Tabela `GlpiTicket` removida (migração `20260916132626_drop_glpi_ticket_tracking`)
+
+Não é mais necessária — `listTicketsForRequester`/`ticketBelongsToRequester` consultam o GLPI
+direto via `search/Ticket`. Isso também **corrige** a limitação da etapa 3 (chamado fora do app
+não aparecia na listagem): agora qualquer chamado onde o usuário é requerente aparece, não importa
+como foi criado.
+
+### `authorName` dos followups agora mais correto
+
+A legada não embute nome/e-mail no followup (só `users_id`), então `listTicketFollowups` ainda
+precisa de uma segunda consulta por autor único (`GET /User/{id}` + `GET /User/{id}/UserEmail`,
+em paralelo) — mesmo padrão best-effort da etapa 3. Mas como `createUser` agora grava `firstname`
++ `_useremails` de verdade, `authorName` prioriza `firstname`+`realname` e só cai pro `username`
+(e-mail) se nenhum dos dois existir — resolve o problema documentado na etapa 3 (autor aparecia
+com o e-mail cru numa releitura).
+
+### Variáveis de ambiente
+
+- **Removidas** (não usadas mais): `GLPI_APP_CLIENT_ID`, `GLPI_APP_CLIENT_SECRET`.
+- **Nova**: `GLPI_V1_API_KEY` (App-Token do Cliente API REST, Configurar > Geral > API).
+- **Reaproveitadas**: `GLPI_URL_API` (só pra derivar a raiz — `LEGACY_ROOT` em `glpi.ts` tira o
+  sufixo de versão e o `/api.php`), `GLPI_SERVICE_ACCOUNT_USERNAME`/`PASSWORD` (agora via Basic
+  Auth em `initSession`, antes eram o grant `password` do OAuth2).
+
+### Testado ponta a ponta (2026-09-16)
+
+Sessão real do Better Auth, dois usuários de teste pra confirmar isolamento: criação de chamado
+com requerente correto numa chamada, listagem específica por usuário (chamado de A não aparece
+pra B), 404 de posse pra followups (B não lê nem posta no chamado de A), followup público
+criado e relido com autor/e-mail corretos, followup privado corretamente excluído da listagem.

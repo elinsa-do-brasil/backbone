@@ -1,14 +1,14 @@
 import { Hono } from 'hono'
 import { auth } from '../lib/auth.js'
-import { prisma } from '../lib/prisma.js'
 import {
   checkGlpiConnection,
   createTicketForRequester,
   createTicketFollowup,
   findOrCreateUserByEmail,
-  getTicket,
   GlpiApiError,
-  listTicketFollowups
+  listTicketFollowups,
+  listTicketsForRequester,
+  ticketBelongsToRequester
 } from '../lib/glpi.js'
 
 export const glpiRoutes = new Hono()
@@ -51,11 +51,6 @@ glpiRoutes.post('/tickets', async (c) => {
       name: name.trim(),
       content: content.trim()
     })
-    // A API v2 do GLPI não permite listar chamados filtrando pelo ator (ver NOTES.md), então o
-    // vínculo (usuário do app, chamado do GLPI) é gravado aqui pra alimentar GET /tickets depois.
-    await prisma.glpiTicket.create({
-      data: { userId: session.user.id, glpiId: ticket.id, name: name.trim() }
-    })
     return c.json({ id: ticket.id }, 201)
   } catch (error) {
     console.error('Falha ao criar chamado no GLPI:', error)
@@ -64,48 +59,40 @@ glpiRoutes.post('/tickets', async (c) => {
   }
 })
 
-// Lista os chamados do usuário logado. A coleção vem da tabela própria (não do GLPI, que não
-// permite filtrar Ticket pelo ator — ver NOTES.md), enriquecida best-effort com status/datas
-// atuais do GLPI: se a consulta a um chamado específico falhar, devolve o que já tem gravado
-// aqui em vez de derrubar a listagem inteira.
+// Lista os chamados do usuário logado, direto do GLPI (busca por requerente via search.php —
+// ver src/lib/glpi.ts). Não depende de o chamado ter sido criado pelo app: um chamado aberto na
+// UI do GLPI ou por um técnico em nome do usuário também aparece aqui.
 glpiRoutes.get('/tickets', async (c) => {
   const session = await auth.api.getSession({ headers: c.req.raw.headers })
   if (!session) {
     return c.json({ message: 'Não autenticado' }, 401)
   }
 
-  const links = await prisma.glpiTicket.findMany({
-    where: { userId: session.user.id },
-    orderBy: { createdAt: 'desc' }
-  })
-
-  const tickets = await Promise.all(
-    links.map(async (link) => {
-      try {
-        const ticket = await getTicket(link.glpiId)
-        return { id: ticket.id, name: ticket.name, status: ticket.status, date: ticket.date, date_mod: ticket.date_mod }
-      } catch (error) {
-        console.error(`Falha ao buscar chamado ${link.glpiId} no GLPI:`, error)
-        const fallbackDate = link.createdAt.toISOString()
-        return { id: link.glpiId, name: link.name, status: null, date: fallbackDate, date_mod: fallbackDate }
-      }
-    })
-  )
-
-  return c.json({ tickets })
+  try {
+    const requester = await findOrCreateUserByEmail(session.user.email, session.user.name || session.user.email)
+    const tickets = await listTicketsForRequester(requester.id)
+    return c.json({ tickets })
+  } catch (error) {
+    console.error('Falha ao listar chamados no GLPI:', error)
+    const message = error instanceof GlpiApiError ? error.message : 'Falha ao listar chamados'
+    return c.json({ message }, 502)
+  }
 })
 
-// Segue o mesmo formato de autorização das rotas de followups abaixo: só quem abriu o chamado
-// pelo app (dono do vínculo na tabela própria) pode ver/postar nele. Necessário porque o perfil
-// de serviço do GLPI enxerga TODOS os chamados da entidade, não só os do usuário autenticado.
-async function findOwnedTicketId(userId: string, ticketIdParam: string): Promise<number | null> {
+// Resolve o `User` do GLPI da sessão e confirma que ele é o requerente do chamado, consultando o
+// GLPI direto (não uma tabela própria — ver src/lib/glpi.ts). Necessário porque o perfil de
+// serviço enxerga TODOS os chamados da entidade, não só os do usuário autenticado: sem essa
+// checagem, qualquer usuário logado no app leria/postaria em chamado de terceiros.
+async function resolveOwnedTicket(
+  session: { user: { id: string; email: string; name: string } },
+  ticketIdParam: string
+): Promise<{ ticketId: number; requesterId: number } | null> {
   const ticketId = Number(ticketIdParam)
   if (!Number.isInteger(ticketId)) return null
 
-  const link = await prisma.glpiTicket.findUnique({
-    where: { userId_glpiId: { userId, glpiId: ticketId } }
-  })
-  return link ? ticketId : null
+  const requester = await findOrCreateUserByEmail(session.user.email, session.user.name || session.user.email)
+  const owns = await ticketBelongsToRequester(ticketId, requester.id)
+  return owns ? { ticketId, requesterId: requester.id } : null
 }
 
 glpiRoutes.get('/tickets/:id/followups', async (c) => {
@@ -114,16 +101,16 @@ glpiRoutes.get('/tickets/:id/followups', async (c) => {
     return c.json({ message: 'Não autenticado' }, 401)
   }
 
-  const ticketId = await findOwnedTicketId(session.user.id, c.req.param('id'))
-  if (ticketId === null) {
+  const owned = await resolveOwnedTicket(session, c.req.param('id'))
+  if (owned === null) {
     return c.json({ message: 'Chamado não encontrado' }, 404)
   }
 
   try {
-    const followups = await listTicketFollowups(ticketId)
+    const followups = await listTicketFollowups(owned.ticketId)
     return c.json({ followups })
   } catch (error) {
-    console.error(`Falha ao listar followups do chamado ${ticketId}:`, error)
+    console.error(`Falha ao listar followups do chamado ${owned.ticketId}:`, error)
     const message = error instanceof GlpiApiError ? error.message : 'Falha ao listar mensagens do chamado'
     return c.json({ message }, 502)
   }
@@ -135,8 +122,8 @@ glpiRoutes.post('/tickets/:id/followups', async (c) => {
     return c.json({ message: 'Não autenticado' }, 401)
   }
 
-  const ticketId = await findOwnedTicketId(session.user.id, c.req.param('id'))
-  if (ticketId === null) {
+  const owned = await resolveOwnedTicket(session, c.req.param('id'))
+  if (owned === null) {
     return c.json({ message: 'Chamado não encontrado' }, 404)
   }
 
@@ -146,16 +133,15 @@ glpiRoutes.post('/tickets/:id/followups', async (c) => {
   }
 
   try {
-    const requester = await findOrCreateUserByEmail(session.user.email, session.user.name || session.user.email)
     const followup = await createTicketFollowup(
-      ticketId,
+      owned.ticketId,
       content.trim(),
       { name: session.user.name || session.user.email, email: session.user.email },
-      requester.id
+      owned.requesterId
     )
     return c.json(followup, 201)
   } catch (error) {
-    console.error(`Falha ao criar followup no chamado ${ticketId}:`, error)
+    console.error(`Falha ao criar followup no chamado ${owned.ticketId}:`, error)
     const message = error instanceof GlpiApiError ? error.message : 'Falha ao enviar mensagem no chamado'
     return c.json({ message }, 502)
   }
