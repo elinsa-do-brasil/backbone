@@ -53,7 +53,7 @@ E a API v2 **não tem** endpoint pra definir o e-mail de outro usuário — exis
 ### Fora de escopo / não implementado
 
 - **Update/Delete de `Ticket`**: o perfil "Bot" só tem criar/ver. Precisa mexer nos direitos no GLPI antes, não é questão de código.
-- **`GET /api/glpi/tickets/{id}` (detalhe de um chamado)**: cogitado, mas o app (client Android/Filament) não precisou — o nome do chamado pra tela de chat já vem do item clicado na listagem. Fora de escopo até que apareça um uso real.
+- ~~`GET /api/glpi/tickets/{id}` (detalhe de um chamado)~~ — **implementado na etapa 4** (ver abaixo), quando apareceu o uso real: a mensagem de abertura do chamado.
 
 ### Implementado (etapa 3, 2026-09-16) — listagem de chamados e followups (chat)
 
@@ -197,3 +197,17 @@ Sessão real do Better Auth, dois usuários de teste pra confirmar isolamento: c
 com requerente correto numa chamada, listagem específica por usuário (chamado de A não aparece
 pra B), 404 de posse pra followups (B não lê nem posta no chamado de A), followup público
 criado e relido com autor/e-mail corretos, followup privado corretamente excluído da listagem.
+
+### `GET /api/glpi/tickets/{id}` — implementado (mesmo dia, depois da migração)
+
+Achado pela sessão do app: a mensagem de abertura do chamado (campo "Descreva o que está
+acontecendo") **não é um followup** — é o `content` do próprio `Ticket`, gravado uma vez na
+criação e nunca mais alterado por esta integração. Sem esse endpoint, a tela de chat não tinha
+como mostrar essa mensagem, só os followups depois dela.
+
+`getTicket(id)` em `src/lib/glpi.ts` busca `GET /Ticket/{id}` (legada) e devolve
+`{id, name, content, status, date, date_mod}` — mesmo formato de status/data já usado na
+listagem. Rota usa a mesma checagem de posse (`resolveOwnedTicket`) das rotas de followups.
+Testado ponta a ponta contra um chamado real criado pelo app (#42): `content` vem populado
+certinho; acesso de outro usuário dá 404; chamado na lixeira (#39, mesmo dono) também dá 404 —
+consistente com a listagem, que já não mostra chamados deletados (ver acima).

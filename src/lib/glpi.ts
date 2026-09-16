@@ -263,6 +263,38 @@ export async function listTicketsForRequester(requesterUserId: number): Promise<
   })
 }
 
+export interface GlpiTicketDetail extends GlpiTicketSummary {
+  content: string
+}
+
+/**
+ * Busca o registro completo de um chamado via `GET /Ticket/{id}` — usado pra tela de chat mostrar
+ * a mensagem de abertura (`content`), que **não é um followup**: é o campo `content` do próprio
+ * `Ticket`, gravado uma vez na criação (ver [createTicketForRequester]) e nunca mais alterado por
+ * esta integração. Igual a [listTicketsForRequester], `status` vem cru daqui e é traduzido aqui
+ * dentro — a legada não traduz `Ticket.status` automaticamente.
+ */
+export async function getTicket(ticketId: number): Promise<GlpiTicketDetail> {
+  return withGlpiSession(async (call) => {
+    const ticket = (await call('GET', `/Ticket/${ticketId}`)) as {
+      id: number
+      name: string
+      content: string
+      status: number
+      date: string | null
+      date_mod: string | null
+    }
+    return {
+      id: ticket.id,
+      name: ticket.name,
+      content: ticket.content,
+      status: { id: ticket.status, name: TICKET_STATUS_NAMES[ticket.status] ?? String(ticket.status) },
+      date: toIsoDateTime(ticket.date),
+      date_mod: toIsoDateTime(ticket.date_mod)
+    }
+  })
+}
+
 /**
  * Confirma se um chamado pertence a um requerente, via `search/Ticket` com dois critérios (id do
  * chamado E requerente). Substitui a checagem de posse que antes vinha da tabela própria no

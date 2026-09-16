@@ -5,6 +5,7 @@ import {
   createTicketForRequester,
   createTicketFollowup,
   findOrCreateUserByEmail,
+  getTicket,
   GlpiApiError,
   listTicketFollowups,
   listTicketsForRequester,
@@ -94,6 +95,31 @@ async function resolveOwnedTicket(
   const owns = await ticketBelongsToRequester(ticketId, requester.id)
   return owns ? { ticketId, requesterId: requester.id } : null
 }
+
+// Detalhe de um chamado — inclui `content` (a mensagem de abertura), que não é um followup e por
+// isso não aparece em GET .../followups. Ficou de fora do escopo inicial (ver NOTES.md) até
+// aparecer um uso real: a tela de chat do app precisa mostrar essa mensagem de abertura junto com
+// os followups.
+glpiRoutes.get('/tickets/:id', async (c) => {
+  const session = await auth.api.getSession({ headers: c.req.raw.headers })
+  if (!session) {
+    return c.json({ message: 'Não autenticado' }, 401)
+  }
+
+  const owned = await resolveOwnedTicket(session, c.req.param('id'))
+  if (owned === null) {
+    return c.json({ message: 'Chamado não encontrado' }, 404)
+  }
+
+  try {
+    const ticket = await getTicket(owned.ticketId)
+    return c.json(ticket)
+  } catch (error) {
+    console.error(`Falha ao buscar chamado ${owned.ticketId} no GLPI:`, error)
+    const message = error instanceof GlpiApiError ? error.message : 'Falha ao buscar chamado'
+    return c.json({ message }, 502)
+  }
+})
 
 glpiRoutes.get('/tickets/:id/followups', async (c) => {
   const session = await auth.api.getSession({ headers: c.req.raw.headers })
