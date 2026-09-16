@@ -210,4 +210,93 @@ como mostrar essa mensagem, só os followups depois dela.
 listagem. Rota usa a mesma checagem de posse (`resolveOwnedTicket`) das rotas de followups.
 Testado ponta a ponta contra um chamado real criado pelo app (#42): `content` vem populado
 certinho; acesso de outro usuário dá 404; chamado na lixeira (#39, mesmo dono) também dá 404 —
-consistente com a listagem, que já não mostra chamados deletados (ver acima).
+consistente com a listagem, que já não mostra chamados deletados (ver abaixo).
+
+## Anexos de arquivo no chat (etapa 5, 2026-09-16) — validação empírica em andamento
+
+Plano completo em `/home/raave/.claude/plans/a-implementa-o-de-envio-jaunty-charm.md`. Decisões
+já fechadas: limite de 15MB por arquivo, lista de permissão de tipo restrita a imagens/PDF/
+documentos comuns, confirmado que este backend **não** vai pra Vercel em produção (então o teto
+rígido de 4.5MB de corpo de requisição/resposta da Vercel Functions não é bloqueio aqui).
+
+### ⚠️ Achado crítico: `uploadManifest` via `fetch`+`FormData` do Node precisa ser STRING, não Blob
+
+`POST /Document` multipart com `uploadManifest` anexado como `new Blob([json], {type:
+'application/json'})` dá **500 com página HTML genérica** ("Ocorreu um erro inesperado", sem
+detalhe). O mesmo payload via `curl -F 'uploadManifest={...};type=application/json'` funciona
+normalmente (**201**). Causa: o `FormData` do WHATWG (usado pelo `fetch` nativo do Node) dá um
+`filename="blob"` sintético a qualquer `Blob` anexado sem nome de arquivo explícito — isso muda o
+`Content-Disposition` da parte multipart de "campo de formulário" pra "arquivo enviado", e o PHP
+do GLPI passa a rotear esse conteúdo pra `$_FILES` em vez de `$_POST`, onde o código que espera
+ler `uploadManifest` como string não acha nada e quebra.
+
+**Correção**: anexar `uploadManifest` como **string pura** —
+`formData.append('uploadManifest', JSON.stringify({...}))`, sem `Blob`/`File` envolvido. Só o
+arquivo de verdade (`filename[N]`) deve ser um `Blob`/`File`. Confirmado funcionando assim.
+Isso é especificamente um gotcha do `fetch`/`FormData` nativo do Node — não afeta curl, e
+provavelmente não afeta o client Android (que já implementou multipart manualmente via
+`HttpURLConnection`, não via um `FormData` de alto nível que sintetiza filename sozinho), mas é
+crítico lembrar ao escrever o código em `src/lib/glpi.ts`, que vai usar `fetch`+`FormData` do Node.
+
+### Confirmado funcionando
+
+| Teste | Resultado |
+|---|---|
+| `POST /Document` multipart (`uploadManifest` string + `filename[0]`) | **201**, cria o `Document` — `id`, e `upload_result.filename[0]` com nome/tamanho/URL interna do arquivo salvo |
+| `POST /ITILFollowup` multipart com `_filename` **numa única chamada** (sem precisar de `/Document` separado) | **201** — cria o followup **e** o anexo juntos. `id` na resposta é o id do **followup**, não do documento. Caminho preferido: elimina o passo de "duas etapas" cogitado no plano. |
+| `POST /Document` com `_filename: ['a.txt', 'b.txt']` + dois `filename[N]` | **201**, um único `id` de retorno, mas `upload_result.filename` vem com **duas** entradas (uma por arquivo) — ainda não confirmado se isso significa dois `Document` de verdade vinculados ao mesmo registro ou só um `Document` com metadado de dois arquivos. Bloqueado de confirmar (ver abaixo). |
+
+### 🚧 BLOQUEIO — sem direito de leitura em `Document`/`Document_Item`
+
+`GET /Document/{id}` (inclusive de um documento **recém-criado pela própria conta de serviço,
+na mesma sessão**) e `GET /Ticket/{id}/Document_Item` respondem **403 `ERROR_RIGHT_MISSING`**.
+Mesmo padrão já visto com Acompanhamentos antes de corrigir o direito: criar funciona, ver não.
+Diferente daquele caso, aqui nem criar-e-ver-o-que-eu-mesmo-criei-na-mesma-sessão funciona — não
+tem visibilidade implícita de dono.
+
+**Bloqueia**: confirmar o resultado real do teste de múltiplos arquivos acima, testar download
+(`GET /Document/{id}?alt=media`), testar a interação com `is_private` de followups, e listar
+anexos de um chamado (`GET /Ticket/{id}/Document_Item`) — ou seja, toda a metade de
+leitura/download da feature.
+
+**Ação necessária (GLPI admin, mesma pessoa que corrigiu Acompanhamentos hoje)**: conceder ao
+perfil "Bot" o direito de **Ver** documentos (Administração > Perfis > Bot, procurar a seção de
+Documentos — nome exato da seção não confirmado, granularidade da doc não especifica).
+
+**Artefatos de teste criados, limpar manualmente** (perfil Bot sem direito de excluir): chamado
+#44 ("TESTE anexos backbone (apagar)"), followup #19 nele (com anexo `a.txt`), `Document` #8, #9,
+#10 (este com dois arquivos, `a.txt`+`b.txt`).
+
+## Bug real achado pelo app: "minha mensagem" trocava de lado depois de recarregar (2026-09-16)
+
+Reportado pela sessão do app: mensagem enviada pelo próprio usuário aparecia como "minha" logo
+após o `POST`, mas como "de outra pessoa" depois de um `GET` (recarregar o chat). O client decidia
+isso comparando `authorEmail` do followup com o e-mail da sessão.
+
+**Investigado contra dados reais** (chamado #42, usuário GLPI #18 = `teste-filament-e2e@agentmail.to`):
+`users_id` dos followups estava **correto** nos dois casos (não é bug de atribuição, já resolvido
+na migração). A causa real são dois problemas de dado, não de código:
+
+1. Esse usuário de teste tem `firstname` **igual ao próprio e-mail** no GLPI — o Better Auth dele
+   nunca teve um nome de exibição diferente do e-mail, então [createUser] gravou o e-mail também
+   como `firstname`. `authorName` mostrar o e-mail cru é reflexo fiel do dado, não bug.
+2. Esse usuário foi auto-provisionado **antes** da migração pra API legada (chamado #39, também
+   dele, já existia antes de hoje) — na v2, `POST /Administration/User` ignorava `emails[]`
+   silenciosamente (etapa 2). `authorEmail` vem `null` porque o GLPI realmente não tem e-mail
+   cadastrado pra esse usuário. A migração de hoje resolve isso só pra usuários **novos**, não
+   retroativamente.
+
+**Correção**: `authorEmail`/`authorName` nunca foram uma base confiável pra "essa mensagem é
+minha" — nome/e-mail podem estar ausentes ou malformados por motivos legítimos (conta de teste,
+usuário pré-migração). Adicionado `authorId` (interno, `users_id` cru) em `GlpiFollowup`
+(`src/lib/glpi.ts`) e um campo novo **`isMine`** na resposta de `GET`/`POST .../followups`
+(`src/routes/glpi.ts`), calculado no backend comparando `authorId` com o requerente já resolvido
+pra sessão — a mesma fonte que já autoriza a escrita (`resolveOwnedTicket`), então não depende de
+nome/e-mail estarem bem preenchidos. `authorId` fica de fora do JSON (`toFollowupResponse` em
+`src/routes/glpi.ts` remove ele antes de devolver) — é detalhe interno, `isMine` é o que o client
+deve usar. `authorName`/`authorEmail` continuam na resposta, só não devem mais ser usados pra
+decidir de qual lado a bolha aparece.
+
+Testado contra o chamado #42 real: as duas mensagens do usuário de teste voltam `isMine: true`;
+uma resposta de um técnico real (conta GLPI de verdade, com nome/e-mail próprios) volta
+`isMine: false`.

@@ -9,7 +9,8 @@ import {
   GlpiApiError,
   listTicketFollowups,
   listTicketsForRequester,
-  ticketBelongsToRequester
+  ticketBelongsToRequester,
+  type GlpiFollowup
 } from '../lib/glpi.js'
 
 export const glpiRoutes = new Hono()
@@ -121,6 +122,18 @@ glpiRoutes.get('/tickets/:id', async (c) => {
   }
 })
 
+// `isMine` é calculado aqui (comparando o `authorId` cru do GLPI com o requerente já resolvido
+// pra esta sessão), não deixado pro client comparar `authorEmail`/`authorName` — achado real
+// (2026-09-16, chamado #42): usuário de teste anterior à migração tem `firstname` igual ao
+// próprio e-mail e nenhum e-mail cadastrado no GLPI, então a comparação por e-mail no client
+// falhava mesmo pra mensagens que o próprio usuário mandou. Ver JSDoc de `GlpiFollowup` em
+// src/lib/glpi.ts. `authorId` fica de fora da resposta — é detalhe interno, não faz parte do
+// contrato combinado com o app.
+function toFollowupResponse(followup: GlpiFollowup, requesterId: number) {
+  const { authorId, ...rest } = followup
+  return { ...rest, isMine: authorId === requesterId }
+}
+
 glpiRoutes.get('/tickets/:id/followups', async (c) => {
   const session = await auth.api.getSession({ headers: c.req.raw.headers })
   if (!session) {
@@ -134,7 +147,7 @@ glpiRoutes.get('/tickets/:id/followups', async (c) => {
 
   try {
     const followups = await listTicketFollowups(owned.ticketId)
-    return c.json({ followups })
+    return c.json({ followups: followups.map((f) => toFollowupResponse(f, owned.requesterId)) })
   } catch (error) {
     console.error(`Falha ao listar followups do chamado ${owned.ticketId}:`, error)
     const message = error instanceof GlpiApiError ? error.message : 'Falha ao listar mensagens do chamado'
@@ -165,7 +178,7 @@ glpiRoutes.post('/tickets/:id/followups', async (c) => {
       { name: session.user.name || session.user.email, email: session.user.email },
       owned.requesterId
     )
-    return c.json(followup, 201)
+    return c.json(toFollowupResponse(followup, owned.requesterId), 201)
   } catch (error) {
     console.error(`Falha ao criar followup no chamado ${owned.ticketId}:`, error)
     const message = error instanceof GlpiApiError ? error.message : 'Falha ao enviar mensagem no chamado'

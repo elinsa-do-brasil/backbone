@@ -317,6 +317,7 @@ export interface GlpiFollowup {
   id: number
   content: string
   date: string | null
+  authorId: number | null
   authorName: string | null
   authorEmail: string | null
   isPrivate: boolean
@@ -336,6 +337,19 @@ export interface GlpiFollowup {
  * pra requerentes auto-provisionados isso já é o nome de exibição real (ver [createUser]), não
  * mais o e-mail cru como acontecia na v2. Falha na busca de um autor não derruba a listagem
  * inteira, só deixa aquele item com `authorName`/`authorEmail` nulos.
+ *
+ * **`authorId` existe pra dar ao chamador um jeito confiável de saber "essa mensagem é minha?"**
+ * — não use `authorName`/`authorEmail` pra isso. Achado real (2026-09-16, chamado #42): um
+ * usuário de teste criado **antes** da migração pra API legada tem `firstname` igual ao próprio
+ * e-mail (o Better Auth desse usuário nunca teve nome de exibição, então
+ * [createUser]/[findOrCreateUserByEmail] gravou o e-mail como `firstname` também) e `emails: []`
+ * no GLPI (era auto-provisionado pela v2, que ignorava `emails[]` — ver etapa 2/4). Resultado:
+ * `authorName` vem como o e-mail cru (dado real do GLPI, não bug) e `authorEmail` vem `null`
+ * (usuário sem e-mail cadastrado, dado real também) — comparar `authorEmail` com o e-mail da
+ * sessão pra decidir "é minha bolha" quebra nesse caso, porque não bate com nada. `authorId`
+ * (o `users_id` cru do GLPI) não depende de nome/e-mail estarem bem preenchidos — é a mesma
+ * fonte que autoriza a escrita (ver `resolveOwnedTicket`/`ticketBelongsToRequester` em
+ * `src/routes/glpi.ts`), então é estável mesmo quando os dados de exibição do usuário não são.
  */
 export async function listTicketFollowups(ticketId: number): Promise<GlpiFollowup[]> {
   return withGlpiSession(async (call) => {
@@ -372,6 +386,7 @@ export async function listTicketFollowups(ticketId: number): Promise<GlpiFollowu
       id: followup.id,
       content: followup.content,
       date: toIsoDateTime(followup.date),
+      authorId: followup.users_id > 0 ? followup.users_id : null,
       authorName: authorById.get(followup.users_id)?.name ?? null,
       authorEmail: authorById.get(followup.users_id)?.email ?? null,
       isPrivate: false
@@ -406,6 +421,7 @@ export async function createTicketFollowup(
       id: created.id,
       content,
       date: new Date().toISOString(),
+      authorId: requesterUserId,
       authorName: author.name,
       authorEmail: author.email,
       isPrivate: false
