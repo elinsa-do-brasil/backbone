@@ -63,27 +63,38 @@ webhookRoutes.post('/glpi', async (c) => {
   const signature = c.req.header('X-GLPI-signature')
   const timestamp = c.req.header('X-GLPI-timestamp')
 
+  // Entrega recusada é logada, não só respondida com 401: sem isso, segredo divergente entre o
+  // GLPI e o `.env` fica indistinguível de "o GLPI não está enviando nada" — os dois casos não
+  // deixam rastro no banco.
   if (!signature || !timestamp) {
+    console.warn('[webhook glpi] recusado: assinatura ou timestamp ausente')
     return c.json({ message: 'Assinatura ausente' }, 401)
   }
 
   const age = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp))
   if (!Number.isFinite(age) || age > TIMESTAMP_TOLERANCE_SECONDS) {
+    console.warn(`[webhook glpi] recusado: timestamp fora da janela (${age}s de diferença)`)
     return c.json({ message: 'Timestamp fora da janela permitida' }, 401)
   }
 
   // A assinatura do GLPI é sobre corpo + timestamp concatenados, nessa ordem.
   if (!signatureMatches(hmacHex(rawBody + timestamp), signature)) {
+    console.warn('[webhook glpi] recusado: assinatura inválida — conferir se GLPI_WEBHOOK_SECRET bate com o segredo cadastrado no webhook do GLPI')
     return c.json({ message: 'Assinatura inválida' }, 401)
   }
 
-  let trigger: { itemtype?: string; event?: string; id?: number }
+  let trigger: WebhookTrigger
   try {
     trigger = extractTrigger(rawBody)
   } catch (error) {
     console.error('Corpo do webhook do GLPI não pôde ser interpretado:', error, rawBody.slice(0, 500))
     return c.json({ message: 'Corpo inválido' }, 400)
   }
+
+  console.log(
+    `[webhook glpi] ${trigger.kind}/${trigger.event ?? '?'} ` +
+      `id=${'id' in trigger ? trigger.id : '?'} (atraso da fila: ${age}s)`
+  )
 
   // Responde rápido e processa o resto sem segurar a conexão: o GLPI entrega por fila e trata
   // resposta lenta como falha. Erro no processamento é logado, não devolvido — reentregar não
@@ -93,42 +104,62 @@ webhookRoutes.post('/glpi', async (c) => {
   return c.json({ ok: true })
 })
 
+type WebhookTrigger =
+  | { kind: 'followup'; id: number; event?: string }
+  | { kind: 'ticket'; id: number; event?: string }
+  | { kind: 'unknown'; event?: string }
+
 /**
- * Tira do corpo só o necessário: itemtype, evento e id do item. Tolerante a variação de formato
- * de propósito — o shape exato do corpo depende do template configurado em cada webhook no GLPI,
- * então procura o id em mais de um lugar plausível em vez de fixar um caminho.
+ * Descobre o que veio na entrega: qual tipo de item e qual id.
+ *
+ * **Armadilha do formato, custou um bug aqui (2026-09-17):** o corpo de um followup traz
+ * `item.itemtype: "Ticket"`, que **não** é o tipo do item entregue — é a coluna do próprio
+ * `ITILFollowup` dizendo a que tipo de objeto ele está anexado. Ler esse campo como "o tipo do
+ * item" faz um followup ser processado como se fosse um chamado, com o id do followup no lugar do
+ * id do chamado. Exemplo real recebido:
+ *
+ * ```json
+ * { "item": { "id": 25, "itemtype": "Ticket", "items_id": 42, "content": "...", ... },
+ *   "event": "new",
+ *   "parent_item": { "id": 42, "name": "...", ... } }
+ * ```
+ * (`id` = followup, `items_id`/`parent_item.id` = chamado)
+ *
+ * O discriminador confiável é a **presença de `parent_item`**: o GLPI só adiciona esse campo
+ * quando o item entregue é filho de outro (`CommonDBChild`/`CommonITILTask`) — um `Ticket` cai no
+ * `else { return; }` e nunca tem. Confirmado no fonte (`Webhook::addParentItemData`, branch 11.0),
+ * ou seja, é fato estrutural e não heurística sobre nomes de campo.
  */
-function extractTrigger(rawBody: string): { itemtype?: string; event?: string; id?: number } {
+function extractTrigger(rawBody: string): WebhookTrigger {
   const parsed = JSON.parse(rawBody) as Record<string, unknown>
-  const item = (parsed.item ?? parsed) as Record<string, unknown>
+  const item = (parsed.item ?? {}) as Record<string, unknown>
+  const event = parsed.event as string | undefined
 
-  const rawId = item.id ?? item.items_id ?? parsed.id ?? parsed.items_id
-  const id = Number(rawId)
+  const id = Number(item.id)
+  if (!Number.isInteger(id)) return { kind: 'unknown', event }
 
-  return {
-    itemtype: (parsed.itemtype ?? item.itemtype) as string | undefined,
-    event: parsed.event as string | undefined,
-    id: Number.isInteger(id) ? id : undefined
+  if (parsed.parent_item !== undefined) {
+    // Item filho. Só tratamos filhos de chamado — followup de Change/Problem não interessa aqui.
+    if (item.itemtype !== 'Ticket') return { kind: 'unknown', event }
+    return { kind: 'followup', id, event }
   }
+
+  return { kind: 'ticket', id, event }
 }
 
-async function handleTrigger(trigger: { itemtype?: string; event?: string; id?: number }): Promise<void> {
-  if (trigger.id === undefined) {
-    console.warn('Webhook do GLPI sem id utilizável, ignorado:', trigger)
-    return
+async function handleTrigger(trigger: WebhookTrigger): Promise<void> {
+  switch (trigger.kind) {
+    case 'followup':
+      // Se o filho não for um followup (uma tarefa, um documento anexado), a releitura devolve
+      // null e o evento é ignorado — falha segura, sem precisar adivinhar o tipo pelo corpo.
+      await handleFollowupEvent(trigger.id)
+      return
+    case 'ticket':
+      await handleTicketEvent(trigger.id)
+      return
+    case 'unknown':
+      console.warn('Webhook do GLPI que não deu pra classificar, ignorado:', trigger)
   }
-
-  if (trigger.itemtype === 'ITILFollowup') {
-    await handleFollowupEvent(trigger.id)
-    return
-  }
-
-  if (trigger.itemtype === 'Ticket') {
-    await handleTicketEvent(trigger.id)
-    return
-  }
-
-  console.warn('Webhook do GLPI com itemtype não tratado, ignorado:', trigger.itemtype)
 }
 
 /** Usuários do app que são requerentes do chamado, casados por e-mail (case-insensitive). */
