@@ -6,6 +6,8 @@ import { auth } from './lib/auth.js'
 import { trustedOrigins } from './lib/trusted-origins.js'
 import { nativeAppSchemes } from './lib/native-app-schemes.js'
 import { glpiRoutes } from './routes/glpi.js'
+import { deviceRoutes } from './routes/devices.js'
+import { webhookRoutes } from './routes/webhooks.js'
 
 const app = new Hono()
 
@@ -23,6 +25,8 @@ app.use(
 app.all('/api/auth/*', (c) => auth.handler(c.req.raw))
 
 app.route('/api/glpi', glpiRoutes)
+app.route('/api/devices', deviceRoutes)
+app.route('/api/webhooks', webhookRoutes)
 
 // Browser-only leg of the OAuth-for-native flow. Native clients pass this as
 // the sign-in `callbackURL` (with `?returnTo=<app-deep-link>` appended), so

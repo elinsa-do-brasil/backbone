@@ -22,6 +22,10 @@ model User {
 
   passkeys Passkey[]
 
+  deviceTokens     DeviceToken[]
+  ticketReadMarks  TicketReadMarker[]
+  unreadFollowups  UnreadFollowup[]
+
   @@unique([email])
   @@map("user")
 }
@@ -36,6 +40,8 @@ model Session {
   userAgent String?
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  deviceToken DeviceToken?
 
   @@unique([token])
   @@index([userId])
@@ -93,4 +99,62 @@ model Passkey {
   @@index([userId])
   @@index([credentialID])
   @@map("passkey")
+}
+
+// Token do FCM de um aparelho. Vinculado à sessão do Better Auth, não só ao usuário: sair da
+// conta apaga a sessão e, em cascata, o token — sem isso um aparelho deslogado continuaria
+// recebendo push. Um token por sessão (`sessionId` é único); o mesmo aparelho reinstalando ou
+// relogando reaproveita a linha pelo `token` (PK), só trocando de sessão.
+model DeviceToken {
+  token     String   @id
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId String   @unique
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  platform  String
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("device_token")
+}
+
+// Até onde o usuário leu num chamado. O estado é do usuário (não do aparelho) pra sincronizar
+// entre aparelhos — quem lê no celular não vê o mesmo chamado como não lido no tablet.
+model TicketReadMarker {
+  userId             String
+  user               User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  glpiTicketId       Int
+  lastReadFollowupId Int
+
+  @@id([userId, glpiTicketId])
+  @@map("ticket_read_marker")
+}
+
+// Uma linha por followup ainda não lido por um usuário. `@@id([userId, followupId])` faz a
+// gravação ser idempotente: entrega repetida do webhook não duplica (o id do followup é único
+// no GLPI inteiro, não só dentro do chamado). `glpiTicketId` fica junto pra contar por chamado
+// sem precisar consultar o GLPI.
+model UnreadFollowup {
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  glpiTicketId Int
+  followupId   Int
+  createdAt    DateTime @default(now())
+
+  @@id([userId, followupId])
+  @@index([userId, glpiTicketId])
+  @@map("unread_followup")
+}
+
+// Último estado conhecido de um chamado, pra detectar o que mudou entre duas entregas do
+// webhook: `statusId` diz se o status mudou de verdade (o GLPI dispara Ticket/update pra
+// qualquer alteração) e `lastFollowupId` serve de fallback pra descobrir followups novos caso
+// o webhook de ITILFollowup não esteja disponível.
+model GlpiTicketState {
+  glpiTicketId   Int      @id
+  statusId       Int
+  lastFollowupId Int      @default(0)
+  updatedAt      DateTime @updatedAt
+
+  @@map("glpi_ticket_state")
 }

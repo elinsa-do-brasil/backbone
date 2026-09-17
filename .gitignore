@@ -18,6 +18,9 @@ src/generated/
 .env*
 !.env.example
 
+# credencial de admin do Firebase (dá acesso completo ao projeto — nunca commitar)
+*firebase-adminsdk*.json
+
 # logs
 logs/
 *.log

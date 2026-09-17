@@ -1,5 +1,7 @@
 import { Hono } from 'hono'
 import { auth } from '../lib/auth.js'
+import { prisma } from '../lib/prisma.js'
+import { getUserTokens, sendToTokens } from '../lib/push.js'
 import {
   checkGlpiConnection,
   createTicketForRequester,
@@ -73,7 +75,28 @@ glpiRoutes.get('/tickets', async (c) => {
   try {
     const requester = await findOrCreateUserByEmail(session.user.email, session.user.name || session.user.email)
     const tickets = await listTicketsForRequester(requester.id)
-    return c.json({ tickets })
+
+    // Estado de leitura vem do Postgres daqui (é por usuário do app, não existe no GLPI) e é
+    // costurado na resposta do GLPI. Duas consultas pro conjunto todo, não uma por chamado.
+    const [unreadCounts, readMarkers] = await Promise.all([
+      prisma.unreadFollowup.groupBy({
+        by: ['glpiTicketId'],
+        where: { userId: session.user.id },
+        _count: { followupId: true }
+      }),
+      prisma.ticketReadMarker.findMany({ where: { userId: session.user.id } })
+    ])
+
+    const unreadByTicket = new Map(unreadCounts.map((row) => [row.glpiTicketId, row._count.followupId]))
+    const markerByTicket = new Map(readMarkers.map((row) => [row.glpiTicketId, row.lastReadFollowupId]))
+
+    return c.json({
+      tickets: tickets.map((ticket) => ({
+        ...ticket,
+        unreadCount: unreadByTicket.get(ticket.id) ?? 0,
+        lastReadFollowupId: markerByTicket.get(ticket.id) ?? null
+      }))
+    })
   } catch (error) {
     console.error('Falha ao listar chamados no GLPI:', error)
     const message = error instanceof GlpiApiError ? error.message : 'Falha ao listar chamados'
@@ -145,8 +168,17 @@ glpiRoutes.get('/tickets/:id/followups', async (c) => {
     return c.json({ message: 'Chamado não encontrado' }, 404)
   }
 
+  // `?after=<followupId>` devolve só o que chegou depois — o app usa isso pra sincronizar
+  // incrementalmente em cima do cache local dele. Sem o parâmetro, devolve a conversa inteira
+  // (comportamento de sempre).
+  const afterParam = c.req.query('after')
+  if (afterParam !== undefined && !Number.isInteger(Number(afterParam))) {
+    return c.json({ message: 'Parâmetro "after" inválido' }, 400)
+  }
+  const after = afterParam !== undefined ? Number(afterParam) : undefined
+
   try {
-    const followups = await listTicketFollowups(owned.ticketId)
+    const followups = await listTicketFollowups(owned.ticketId, { after })
     return c.json({ followups: followups.map((f) => toFollowupResponse(f, owned.requesterId)) })
   } catch (error) {
     console.error(`Falha ao listar followups do chamado ${owned.ticketId}:`, error)
@@ -184,4 +216,52 @@ glpiRoutes.post('/tickets/:id/followups', async (c) => {
     const message = error instanceof GlpiApiError ? error.message : 'Falha ao enviar mensagem no chamado'
     return c.json({ message }, 502)
   }
+})
+
+// Marca o chamado como lido até um followup. O marcador só avança (`max` do atual com o
+// recebido) — mensagem fora de ordem ou retry do app não "desmarca" o que já estava lido.
+glpiRoutes.post('/tickets/:id/read', async (c) => {
+  const session = await auth.api.getSession({ headers: c.req.raw.headers })
+  if (!session) {
+    return c.json({ message: 'Não autenticado' }, 401)
+  }
+
+  const owned = await resolveOwnedTicket(session, c.req.param('id'))
+  if (owned === null) {
+    return c.json({ message: 'Chamado não encontrado' }, 404)
+  }
+
+  const { lastReadFollowupId } = await c.req.json<{ lastReadFollowupId?: number }>()
+  if (!Number.isInteger(lastReadFollowupId)) {
+    return c.json({ message: 'Informe lastReadFollowupId' }, 400)
+  }
+
+  const existing = await prisma.ticketReadMarker.findUnique({
+    where: { userId_glpiTicketId: { userId: session.user.id, glpiTicketId: owned.ticketId } }
+  })
+  const marker = Math.max(existing?.lastReadFollowupId ?? 0, lastReadFollowupId as number)
+
+  const [, , unreadCount] = await prisma.$transaction([
+    prisma.ticketReadMarker.upsert({
+      where: { userId_glpiTicketId: { userId: session.user.id, glpiTicketId: owned.ticketId } },
+      create: { userId: session.user.id, glpiTicketId: owned.ticketId, lastReadFollowupId: marker },
+      update: { lastReadFollowupId: marker }
+    }),
+    prisma.unreadFollowup.deleteMany({
+      where: { userId: session.user.id, glpiTicketId: owned.ticketId, followupId: { lte: marker } }
+    }),
+    prisma.unreadFollowup.count({ where: { userId: session.user.id, glpiTicketId: owned.ticketId } })
+  ])
+
+  // Avisa os OUTROS aparelhos do usuário pra eles zerarem o badge sozinhos. O aparelho que
+  // chamou já sabe — mandar pra ele seria eco redundante.
+  const tokens = await getUserTokens(session.user.id, { exceptSessionId: session.session.id })
+  void sendToTokens(tokens, {
+    type: 'ticket.read',
+    ticketId: String(owned.ticketId),
+    lastReadFollowupId: String(marker),
+    unreadCount: String(unreadCount)
+  })
+
+  return c.json({ unreadCount, lastReadFollowupId: marker })
 })

@@ -17,6 +17,7 @@
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",
     "better-auth": "^1.7.4",
+    "firebase-admin": "^14.4.0",
     "hono": "^4.13.5",
     "resend": "^6.24.0"
   },

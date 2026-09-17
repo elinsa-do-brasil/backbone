@@ -350,8 +350,15 @@ export interface GlpiFollowup {
  * (o `users_id` cru do GLPI) não depende de nome/e-mail estarem bem preenchidos — é a mesma
  * fonte que autoriza a escrita (ver `resolveOwnedTicket`/`ticketBelongsToRequester` em
  * `src/routes/glpi.ts`), então é estável mesmo quando os dados de exibição do usuário não são.
+ *
+ * `opts.after` devolve só followups com id maior que o informado — é o que permite ao app
+ * sincronizar incrementalmente (buscar só o que chegou depois do que ele já tem em cache) em vez
+ * de baixar a conversa inteira a cada abertura.
  */
-export async function listTicketFollowups(ticketId: number): Promise<GlpiFollowup[]> {
+export async function listTicketFollowups(
+  ticketId: number,
+  opts?: { after?: number }
+): Promise<GlpiFollowup[]> {
   return withGlpiSession(async (call) => {
     const raw = (await call('GET', `/Ticket/${ticketId}/ITILFollowup`)) as Array<{
       id: number
@@ -361,7 +368,12 @@ export async function listTicketFollowups(ticketId: number): Promise<GlpiFollowu
       users_id: number
     }> | null
 
-    const publicFollowups = (raw ?? []).filter((followup) => !followup.is_private)
+    // O filtro por `after` acontece antes da resolução de autor (abaixo) de propósito: o GLPI não
+    // filtra a sub-coleção por id, então o corte é feito aqui, e fazer isso antes evita buscar
+    // dados de autores que nem vão ser devolvidos.
+    const publicFollowups = (raw ?? [])
+      .filter((followup) => !followup.is_private)
+      .filter((followup) => opts?.after === undefined || followup.id > opts.after)
 
     const authorIds = [...new Set(publicFollowups.map((followup) => followup.users_id).filter((id) => id > 0))]
     const authorById = new Map<number, { name: string | null; email: string | null }>()
@@ -425,6 +437,126 @@ export async function createTicketFollowup(
       authorName: author.name,
       authorEmail: author.email,
       isPrivate: false
+    }
+  })
+}
+
+export interface GlpiFollowupRecord {
+  id: number
+  ticketId: number
+  content: string
+  date: string | null
+  isPrivate: boolean
+  authorId: number | null
+}
+
+/**
+ * Lê um followup pelo id, sem passar pelo chamado. Usado pelo webhook: a entrega do GLPI serve só
+ * de gatilho (diz "o followup X mudou"), e o estado de verdade é relido aqui — o corpo do webhook
+ * segue o shape da API v2, que já se mostrou não confiável (envelope não documentado, campos que
+ * somem), e além disso pode chegar defasado se a fila do GLPI atrasar.
+ *
+ * Devolve `null` se o followup não existir mais (apagado entre a entrega e a leitura).
+ */
+export async function getFollowup(followupId: number): Promise<GlpiFollowupRecord | null> {
+  return withGlpiSession(async (call) => {
+    try {
+      const raw = (await call('GET', `/ITILFollowup/${followupId}`)) as {
+        id: number
+        itemtype: string
+        items_id: number
+        content: string
+        date: string
+        is_private: number | boolean
+        users_id: number
+      }
+      if (raw.itemtype !== 'Ticket') return null
+      return {
+        id: raw.id,
+        ticketId: raw.items_id,
+        content: raw.content,
+        date: toIsoDateTime(raw.date),
+        isPrivate: Boolean(raw.is_private),
+        authorId: raw.users_id > 0 ? raw.users_id : null
+      }
+    } catch (error) {
+      if (error instanceof GlpiApiError && error.statusCode === 404) return null
+      throw error
+    }
+  })
+}
+
+/**
+ * E-mails dos requerentes de um chamado, pra cruzar com as contas do app.
+ *
+ * Busca em duas frentes pelo mesmo motivo de [findUserByEmail]: requerente cadastrado pela UI do
+ * GLPI tem e-mail em `UserEmail`, mas quem foi auto-provisionado por esta integração antes da
+ * migração pra API legada não tem — nesses o e-mail está no `name` (username). Devolve tudo em
+ * minúsculas porque a comparação com o e-mail da conta do app é case-insensitive.
+ */
+export async function getTicketRequesterEmails(ticketId: number): Promise<string[]> {
+  return withGlpiSession(async (call) => {
+    const actors = (await call('GET', `/Ticket/${ticketId}/Ticket_User`)) as Array<{
+      users_id: number
+      type: number
+    }> | null
+
+    // type 1 = requerente (CommonITILActor::REQUESTER)
+    const requesterIds = [...new Set((actors ?? []).filter((a) => a.type === 1).map((a) => a.users_id))]
+
+    const emails = await Promise.all(
+      requesterIds.map(async (userId) => {
+        try {
+          const [user, userEmails] = await Promise.all([
+            call('GET', `/User/${userId}`) as Promise<{ name?: string }>,
+            call('GET', `/User/${userId}/UserEmail`) as Promise<Array<{ email: string }> | null>
+          ])
+          const fromRelation = (userEmails ?? []).map((row) => row.email)
+          const fromUsername = user.name?.includes('@') ? [user.name] : []
+          return [...fromRelation, ...fromUsername]
+        } catch (error) {
+          console.error(`Falha ao buscar e-mails do requerente ${userId} do chamado ${ticketId}:`, error)
+          return []
+        }
+      })
+    )
+
+    return [...new Set(emails.flat().map((email) => email.toLowerCase()))]
+  })
+}
+
+export interface GlpiUserInfo {
+  id: number
+  displayName: string | null
+  emails: string[]
+}
+
+/**
+ * Nome de exibição e e-mails de um usuário do GLPI, numa consulta só.
+ *
+ * Mesma regra de exibição de [listTicketFollowups]: prioriza `firstname`+`realname` e cai pro
+ * `name` (username) quando nenhum dos dois existe. Os e-mails vêm da relação `UserEmail` mais o
+ * `name`, quando ele é um e-mail — é assim que dá pra reconhecer requerente auto-provisionado
+ * antes da migração, que não tem e-mail na relação (ver [findUserByEmail]).
+ */
+export async function getUserInfo(userId: number): Promise<GlpiUserInfo | null> {
+  return withGlpiSession(async (call) => {
+    try {
+      const [user, userEmails] = await Promise.all([
+        call('GET', `/User/${userId}`) as Promise<{ name?: string; firstname?: string | null; realname?: string | null }>,
+        call('GET', `/User/${userId}/UserEmail`) as Promise<Array<{ email: string }> | null>
+      ])
+
+      const displayName = [user.firstname, user.realname].filter(Boolean).join(' ').trim() || user.name || null
+      const emails = [
+        ...(userEmails ?? []).map((row) => row.email),
+        ...(user.name?.includes('@') ? [user.name] : [])
+      ].map((email) => email.toLowerCase())
+
+      return { id: userId, displayName, emails: [...new Set(emails)] }
+    } catch (error) {
+      console.error(`Falha ao buscar dados do usuário ${userId} no GLPI:`, error)
+      return null
     }
   })
 }

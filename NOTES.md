@@ -300,3 +300,107 @@ decidir de qual lado a bolha aparece.
 Testado contra o chamado #42 real: as duas mensagens do usuário de teste voltam `isMine: true`;
 uma resposta de um técnico real (conta GLPI de verdade, com nome/e-mail próprios) volta
 `isMine: false`.
+
+## Sync incremental, lido/não lido, push e webhook (etapa 6, 2026-09-17)
+
+Pedido da sessão do app (filament-ce) pro app virar offline-first: sincronização incremental de
+followups, estado de lido/não lido compartilhado entre aparelhos, registro de dispositivo, webhook
+do GLPI e push via FCM.
+
+### Tabelas novas (migração `20260917124557_add_push_sync_tables`)
+
+- **`DeviceToken`** (`token` PK, `userId`, `sessionId` único, `platform`): o vínculo é com a
+  **sessão** do Better Auth, não só com o usuário — sair da conta apaga a sessão e o token vai
+  junto por cascata. Sem isso, um aparelho deslogado continuaria recebendo push dos chamados de
+  quem usou ele antes.
+- **`TicketReadMarker`** (PK composta `userId`+`glpiTicketId`): até onde o usuário leu. Estado é
+  do usuário, não do aparelho — ler no celular zera o badge no tablet.
+- **`UnreadFollowup`** (PK composta `userId`+`followupId`): uma linha por mensagem não lida. O PK
+  composto é o que torna a gravação idempotente — entrega repetida do webhook não duplica.
+- **`GlpiTicketState`** (`glpiTicketId` PK, `statusId`, `lastFollowupId`): último estado conhecido,
+  pra detectar mudança de status real e servir de marca d'água de followups.
+
+### Endpoints
+
+- `GET /api/glpi/tickets/:id/followups?after=<id>` — só followups com id maior. Sem o parâmetro,
+  comportamento de sempre. O corte acontece antes da resolução de autor, pra não buscar dados de
+  autor que não vão ser devolvidos.
+- `GET /api/glpi/tickets` — cada item ganhou `unreadCount` e `lastReadFollowupId`, costurados do
+  Postgres em duas consultas pro conjunto todo (não uma por chamado).
+- `POST /api/glpi/tickets/:id/read` `{lastReadFollowupId}` → `{unreadCount, lastReadFollowupId}`.
+  O marcador só avança (`max` do atual com o recebido) — retry ou mensagem fora de ordem do app
+  não "desmarca" o que já estava lido. Manda push `ticket.read` pros OUTROS aparelhos do usuário
+  (identificados por `sessionId` diferente do da chamada).
+- `POST /api/devices` `{token, platform}` → 204. Upsert pelo token; se a sessão já tinha outro
+  token registrado (rotação do FCM), o antigo é apagado antes.
+- `POST /api/webhooks/glpi` — sem Better Auth (quem chama é o GLPI). Ver abaixo.
+
+### ⚠️ O GLPI valida a URL do webhook com um desafio (CRA) — não estava na especificação
+
+Confirmado no fonte (`Webhook::validateCRAChallenge`, branch 11.0): ao salvar/testar o webhook, o
+GLPI faz um **GET** na URL com `?crc_token=<assinatura>` e espera receber de volta, **em texto
+puro**, o `hash_hmac('sha256', crc_token, segredo)`. Sem responder isso, o GLPI marca a URL como
+inválida. Implementado junto com o POST.
+
+### Assinatura das entregas (confirmada no fonte, não só na doc)
+
+`src/Webhook.php` (branch 11.0, linha ~1233):
+```php
+'X-GLPI-signature' => self::getSignature($body . $timestamp, decrypt($webhook->fields['secret'])),
+'X-GLPI-timestamp' => $timestamp,
+```
+e `getSignature($data, $secret) => hash_hmac('sha256', $data, $secret)` — **hex minúsculo** (o
+`$binary` do PHP fica no default `false`). Ou seja: HMAC-SHA256 de (corpo cru + timestamp), nessa
+ordem. Comparação em tempo constante (`timingSafeEqual`) e timestamp com tolerância de ±5 min
+contra replay.
+
+### O corpo do webhook é só gatilho
+
+Do corpo só saem `itemtype`/`event`/`id`; tudo que vira push ou vai pro banco é **relido da API
+legada**. Dois motivos: o corpo segue o shape da API v2, que já mentiu mais de uma vez neste
+projeto (envelope não documentado, campo ignorado em silêncio), e a entrega é assíncrona (fila
+`QueuedWebhook` processada pelo cron), então pode chegar defasada. A extração do id é tolerante a
+variação de formato de propósito, porque o corpo depende do template configurado em cada webhook.
+
+### Regras de negócio implementadas
+
+- Followup **privado nunca** vira push nem não lida (nota interna entre técnicos).
+- Followup de terceiro → grava não lida (só se `followupId > marcador`) e manda `followup.created`.
+- Followup do **próprio usuário** → manda `followup.created` com `isMine=true` e **sem** não lida:
+  é o que sincroniza os outros aparelhos dele quando responde pela UI do GLPI ou por outro
+  aparelho.
+- `Ticket/update` → compara com o `statusId` guardado; só manda `ticket.status_changed` se mudou
+  de verdade. Primeira vez que vê o chamado: só grava, sem push (senão todo chamado antigo geraria
+  um push de "mudou" que nunca mudou).
+- `lastFollowupId` é **marca d'água** (só avança). Bug pego em teste: gravar "o último
+  processado" fazia o valor regredir com entrega fora de ordem.
+- O handler de followup **não** atualiza `statusId` — se atualizasse, uma mudança automática de
+  status disparada pelo próprio followup chegaria já gravada e o push de status sumiria.
+
+### Push (FCM)
+
+Data-only, `android.priority = high`, todos os valores string. Data-only de propósito: o app é
+offline-first e precisa receber a mensagem mesmo em background pra atualizar o Room — notification
+messages não chegam no handler nesse caso. `content` é truncado por **bytes** (não caracteres,
+por causa de acento/emoji) pra caber no limite de 4 KB, com `contentTruncated` avisando o app.
+Token que o FCM reportar como `registration-token-not-registered` é apagado do banco.
+
+Falha de push nunca derruba a requisição: o estado real está no GLPI e no Postgres, e o app
+sincroniza sozinho ao abrir. Sem `FIREBASE_SERVICE_ACCOUNT_FILE` o backend sobe normal, só com
+push desativado (avisa no log).
+
+### Testado (2026-09-17)
+
+Assinatura válida → 200; inválida → 401; ausente → 401; timestamp de 10 min atrás → 401; desafio
+CRA responde o HMAC certo, **inclusive pelo túnel público** (`dev.elinsadobrasil.com.br`).
+Processamento com followups reais do chamado #42: followup de técnico virou não lida; reentrega do
+mesmo followup não duplicou; followup do próprio usuário não virou não lida; `lastFollowupId` não
+regrediu com entrega fora de ordem; mudança de status detectada relendo o status real do GLPI.
+
+### Pendente
+
+- Push de verdade (ainda não testado contra o FCM — falta `FIREBASE_SERVICE_ACCOUNT_FILE` no `.env`).
+- Confirmar na instância se `ITILFollowup` aparece como itemtype disponível em Configurar >
+  Webhooks, se adicionar followup também dispara `Ticket/update`, e se a ação automática
+  `queuedwebhook` roda no cron em modo CLI (em modo "interno" a entrega só sai com visita à UI, e
+  a latência do push vira o intervalo do cron).
